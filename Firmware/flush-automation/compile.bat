@@ -4,6 +4,11 @@ echo   Building Raspberry Pi Pico firmware
 echo ========================================
 echo.
 
+@REM  Install rp2040 platform in arduino-cli
+@REM  before running this script
+@REM  
+
+
 arduino-cli compile --fqbn rp2040:rp2040:rpipico --output-dir build .
 
 if %ERRORLEVEL% NEQ 0 (
