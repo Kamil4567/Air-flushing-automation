@@ -1,0 +1,16 @@
+{
+  "name": "INA219 Current Sensor",
+  "author": "ALAN ARIEL GOMEZ GONZALEZ",
+  "pins": [
+    "VCC",
+    "GND",
+    "SCL",
+    "SDA",
+    "Z2",
+    "PUMP"
+  ],
+  "display": {
+    "width": 128,
+    "height": 64
+  }
+}

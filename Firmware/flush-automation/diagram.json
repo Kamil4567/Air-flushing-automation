@@ -1,0 +1,385 @@
+{
+  "version": 1,
+  "author": "ALAN ARIEL GOMEZ GONZALEZ",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-pi-pico",
+      "id": "pico",
+      "top": -521.55,
+      "left": 118.8,
+      "attrs": {}
+    },
+    {
+      "type": "board-ssd1306",
+      "id": "oled1",
+      "top": -102.46,
+      "left": -124.57,
+      "attrs": {
+        "i2cAddress": "0x3c"
+      }
+    },
+    {
+      "type": "wokwi-ky-040",
+      "id": "encoder1",
+      "top": -228.7,
+      "left": -164,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led1",
+      "top": -186,
+      "left": 80.6,
+      "attrs": {
+        "color": "red"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led2",
+      "top": -128.4,
+      "left": 80.6,
+      "attrs": {
+        "color": "red"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led3",
+      "top": -70.8,
+      "left": 80.6,
+      "attrs": {
+        "color": "red"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "text1",
+      "top": -172.8,
+      "left": 124.8,
+      "attrs": {
+        "text": "Z1: Napelnianie azot"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "text2",
+      "top": -115.2,
+      "left": 124.8,
+      "attrs": {
+        "text": "Z2: wyjscie"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "text3",
+      "top": -57.6,
+      "left": 124.8,
+      "attrs": {
+        "text": "Pompa"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn1",
+      "top": -387.4,
+      "left": -115.2,
+      "attrs": {
+        "color": "green",
+        "xray": ""
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn2",
+      "top": -320.2,
+      "left": -115.2,
+      "attrs": {
+        "color": "red",
+        "xray": ""
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "text4",
+      "top": -374.4,
+      "left": -182.4,
+      "attrs": {
+        "text": "START"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "text5",
+      "top": -307.2,
+      "left": -172.8,
+      "attrs": {
+        "text": "STOP"
+      }
+    },
+    {
+      "type": "wokwi-buzzer",
+      "id": "bz1",
+      "top": -542.1,
+      "left": -127.5,
+      "rotate": 270,
+      "attrs": {
+        "volume": "0.1"
+      }
+    },
+    {
+      "type": "chip-ina219",
+      "id": "ina219",
+      "top": -300,
+      "left": 130
+    }
+  ],
+  "connections": [
+    [
+      "pico:GP0",
+      "$serialMonitor:RX",
+      "",
+      []
+    ],
+    [
+      "pico:GP1",
+      "$serialMonitor:TX",
+      "",
+      []
+    ],
+    [
+      "pico:GND.1",
+      "bz1:1",
+      "black",
+      [
+        "h0"
+      ]
+    ],
+    [
+      "pico:GND.1",
+      "btn1:1.r",
+      "black",
+      [
+        "h-153.6",
+        "v115.2"
+      ]
+    ],
+    [
+      "pico:GND.1",
+      "btn2:1.r",
+      "black",
+      [
+        "h-153.6",
+        "v182.4"
+      ]
+    ],
+    [
+      "bz1:2",
+      "pico:GP0",
+      "orange",
+      [
+        "h19.2",
+        "v0.4"
+      ]
+    ],
+    [
+      "pico:GP1",
+      "btn1:2.r",
+      "gold",
+      [
+        "h-144",
+        "v144",
+        "h-29"
+      ]
+    ],
+    [
+      "pico:GP2",
+      "btn2:2.r",
+      "gold",
+      [
+        "h-134.4",
+        "v191.8"
+      ]
+    ],
+    [
+      "pico:GP3",
+      "encoder1:CLK",
+      "violet",
+      [
+        "h-124.8",
+        "v249.6"
+      ]
+    ],
+    [
+      "pico:GND.1",
+      "encoder1:GND",
+      "black",
+      [
+        "h-96",
+        "v307.2"
+      ]
+    ],
+    [
+      "pico:3V3",
+      "encoder1:VCC",
+      "red",
+      [
+        "h20.4",
+        "v-57.6",
+        "h-172.8",
+        "v336"
+      ]
+    ],
+    [
+      "pico:GP4",
+      "oled1:SDA",
+      "green",
+      [
+        "h-76.8",
+        "v307.2",
+        "h-105.6"
+      ]
+    ],
+    [
+      "pico:GP5",
+      "oled1:SCL",
+      "green",
+      [
+        "h-67.2",
+        "v307.2",
+        "h-124.8"
+      ]
+    ],
+    [
+      "pico:GND.1",
+      "oled1:GND",
+      "black",
+      [
+        "h-96",
+        "v355.2",
+        "h-115.2"
+      ]
+    ],
+    [
+      "pico:3V3",
+      "oled1:VCC",
+      "red",
+      [
+        "h20.4",
+        "v-57.6",
+        "h-172.8",
+        "v403.2",
+        "h-115.2"
+      ]
+    ],
+    [
+      "pico:GP6",
+      "encoder1:DT",
+      "violet",
+      [
+        "h-115.2",
+        "v220.8"
+      ]
+    ],
+    [
+      "pico:GP7",
+      "encoder1:SW",
+      "violet",
+      [
+        "h-105.6",
+        "v220.8"
+      ]
+    ],
+    [
+      "led1:A",
+      "pico:GP8",
+      "green",
+      [
+        "v0",
+        "h9.6",
+        "v-134.4",
+        "h-48",
+        "v-134.4"
+      ]
+    ],
+    [
+      "led1:C",
+      "pico:GND.1",
+      "black",
+      []
+    ],
+    [
+      "pico:GP9",
+      "led2:A",
+      "green",
+      [
+        "h-48",
+        "v278.4",
+        "h38.4",
+        "v38.4"
+      ]
+    ],
+    [
+      "led2:C",
+      "pico:GND.1",
+      "black",
+      []
+    ],
+    [
+      "pico:GP10",
+      "led3:A",
+      "green",
+      [
+        "h-38.4",
+        "v316.8",
+        "h28.8",
+        "v38.4"
+      ]
+    ],
+    [
+      "led3:C",
+      "pico:GND.1",
+      "black",
+      []
+    ],
+
+    [
+      "ina219:VCC",
+      "pico:3V3",
+      "red",
+      []
+    ],
+    [
+      "ina219:GND",
+      "pico:GND.1",
+      "black",
+      []
+    ],
+    [
+      "ina219:SDA",
+      "pico:GP4",
+      "green",
+      []
+    ],
+    [
+      "ina219:SCL",
+      "pico:GP5",
+      "green",
+      []
+    ],
+    [
+      "ina219:Z2",
+      "pico:GP9",
+      "green",
+      []
+    ],
+    [
+      "ina219:PUMP",
+      "pico:GP10",
+      "green",
+      []
+    ]
+  ],
+  "dependencies": {}
+}

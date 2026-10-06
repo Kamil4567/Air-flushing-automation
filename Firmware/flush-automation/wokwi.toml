@@ -1,0 +1,8 @@
+[wokwi]
+version = 1
+firmware = 'build/flush-automation.ino.uf2'
+elf = 'build/flush-automation.ino.elf'
+
+[[chip]]
+name = 'ina219'
+binary = 'chips/ina219.chip.wasm'
