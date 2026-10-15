@@ -4,8 +4,11 @@
 #include <hardware/watchdog.h>
 
 #include "UIBitmaps.h"
+#include "HomeV2Bitmaps.h"
+#include "TimeCalibrationBitmaps.h"
 #include "StatusBitmaps.h"
 #include "SettingsBitmaps.h"
+#include "SettingsV2Bitmaps.h"
 #include "ConfigStore.h"
 #include "Ui.h"
 #include "Procedure.h"
@@ -20,6 +23,8 @@ constexpr uint8_t kEncoderDataPin = 6;
 constexpr uint8_t kEncoderButtonPin = 7;
 constexpr uint8_t kStartButtonPin = 1;
 constexpr uint8_t kStopButtonPin = 2;
+constexpr uint8_t kFillButtonPin = 17;
+constexpr uint8_t kEmptyButtonPin = 16;
 constexpr int16_t kScreenWidth = 128;
 constexpr int16_t kScreenHeight = 64;
 constexpr uint32_t kButtonDebounceMs = 25;
@@ -44,9 +49,18 @@ uint8_t statusAllCycles = 0;
 uint32_t statusElapsedSeconds = 0;
 uint32_t statusMaximumSeconds = 0;
 uint8_t settingsPosition = 0;
-uint8_t boolEditSelection = 0;
 uint8_t confirmSelection = 0;
 uint32_t numberEditValue = 1;
+uint8_t timeCalibrationStep = 0;
+uint32_t fillCalibrationElapsedMs = 0;
+uint32_t emptyCalibrationElapsedMs = 0;
+uint32_t fillCalibrationStartedAt = 0;
+uint32_t emptyCalibrationStartedAt = 0;
+bool fillCalibrationButtonActive = false;
+bool emptyCalibrationButtonActive = false;
+uint16_t displayedCalibrationTenths = UINT16_MAX;
+uint8_t homeManualOutputMode = 0;
+bool homeManualLockout = false;
 
 struct DebouncedButton {
   uint8_t pin;
@@ -74,21 +88,28 @@ void markScreenDirty() {
   screenDirty = true;
 }
 
+uint16_t currentCalibrationDisplayTenths(uint32_t now);
+
 const uint8_t *homeBackground() {
   if (selectedOption == 0) {
-    return HOME_SELECTED_0;
+    return HOME_V2_SELECTED_0;
   }
   if (selectedOption == 1) {
-    return HOME_SELECTED_1;
+    return HOME_V2_SELECTED_1;
+  }
+  if (selectedOption == 2) {
+    return HOME_V2_SELECTED_2;
   }
 
   switch (cursorPosition) {
     case 1:
-      return HOME_CURSOR_1;
+      return HOME_V2_CURSOR_1;
     case 2:
-      return HOME_CURSOR_2;
+      return HOME_V2_CURSOR_2;
+    case 3:
+      return HOME_V2_CURSOR_3;
     default:
-      return HOME_CURSOR_0;
+      return HOME_V2_CURSOR_0;
   }
 }
 
@@ -103,21 +124,42 @@ void drawHomeScreen() {
                      SSD1306_WHITE);
 
   const bool cyclesInverted = selectedOption == 0;
-  drawDigit(config.cycles / 10, 16, 5, cyclesInverted);
-  drawDigit(config.cycles % 10, 26, 5, cyclesInverted);
+  drawDigit(config.cycles / 10, 16, 2, cyclesInverted);
+  drawDigit(config.cycles % 10, 26, 2, cyclesInverted);
 
   const bool fillTimeInverted = selectedOption == 1;
-  drawDigit(config.fill_time / 100, 16, 31, fillTimeInverted);
-  drawDigit((config.fill_time / 10) % 10, 26, 31, fillTimeInverted);
-  drawDigit(config.fill_time % 10, 40, 31, fillTimeInverted);
+  drawDigit(config.fill_time / 100, 16, 17, fillTimeInverted);
+  drawDigit((config.fill_time / 10) % 10, 26, 17, fillTimeInverted);
+  drawDigit(config.fill_time % 10, 40, 17, fillTimeInverted);
+
+  const bool emptyTimeInverted = selectedOption == 2;
+  drawDigit(config.empty_time / 100, 16, 34, emptyTimeInverted);
+  drawDigit((config.empty_time / 10) % 10, 26, 34, emptyTimeInverted);
+  drawDigit(config.empty_time % 10, 40, 34, emptyTimeInverted);
+}
+
+void drawTimeCalibrationScreen() {
+  const uint8_t *bitmap = TIME_CALIBRATION_STEP_1;
+  if (timeCalibrationStep == 2) {
+    bitmap = TIME_CALIBRATION_STEP_2;
+  } else if (timeCalibrationStep == 3) {
+    bitmap = TIME_CALIBRATION_STEP_3;
+  }
+  display.drawBitmap(0, 0, bitmap, kScreenWidth, kScreenHeight,
+                     SSD1306_WHITE);
+
+  if (timeCalibrationStep == 2 || timeCalibrationStep == 3) {
+    const uint16_t tenths = currentCalibrationDisplayTenths(millis());
+    drawDigit(tenths / 100, 88, 26, true);
+    drawDigit((tenths / 10) % 10, 98, 26, true);
+    drawDigit(tenths % 10, 112, 26, true);
+  }
 }
 
 const uint8_t *statusBackground() {
   switch (statusPhase) {
     case STATUS_FILL:
       return STATUS_FILL_BITMAP;
-    case STATUS_CALIBRATION:
-      return STATUS_CALIBRATION_BITMAP;
     default:
       return STATUS_EMPTY_BITMAP;
   }
@@ -196,48 +238,58 @@ void drawStatusScreen() {
   }
 }
 
-const uint8_t *settingsMenuBackground() {
-  switch (settingsPosition) {
-    case 1: return SETTINGS_PAGE_1;
-    case 2: return SETTINGS_PAGE_2;
-    case 3: return SETTINGS_PAGE_3;
-    case 4: return SETTINGS_PAGE_4;
-    case 5: return SETTINGS_PAGE_5;
-    case 6: return SETTINGS_PAGE_6;
-    case 7: return SETTINGS_PAGE_7;
-    default: return SETTINGS_PAGE_0;
+void drawSettingsLine(const char *text, int16_t x, int16_t y,
+                      uint16_t foreground, uint16_t background,
+                      uint32_t acuteMask = 0, uint32_t dotMask = 0,
+                      uint32_t slashMask = 0) {
+  display.setTextSize(1);
+  display.setTextColor(foreground, background);
+  display.setCursor(x, y);
+  display.print(text);
+
+  for (uint8_t index = 0; index < 20; ++index) {
+    const int16_t markX = x + index * 6;
+    if (acuteMask & (1UL << index)) {
+      display.drawLine(markX + 2, y - 2, markX + 3, y - 1, foreground);
+    }
+    if (dotMask & (1UL << index)) {
+      display.drawPixel(markX + 2, y - 2, foreground);
+    }
+    if (slashMask & (1UL << index)) {
+      display.drawLine(markX + 1, y + 1, markX + 3, y - 1, foreground);
+    }
   }
 }
 
-const uint8_t *boolEditBackground() {
-  if (settingsPosition == 1) {
-    return boolEditSelection == 0 ? BOOL_BOOT_NO : BOOL_BOOT_YES;
-  }
-  return boolEditSelection == 0 ? BOOL_BEFORE_NO : BOOL_BEFORE_YES;
+void drawSettingsMenu() {
+  static const uint8_t *const pages[] = {
+      SETTINGS_V2_PAGE_0, SETTINGS_V2_PAGE_1, SETTINGS_V2_PAGE_2,
+      SETTINGS_V2_PAGE_3, SETTINGS_V2_PAGE_4,
+  };
+  display.drawBitmap(0, 0, pages[settingsPosition], kScreenWidth,
+                     kScreenHeight, SSD1306_WHITE);
 }
 
 const uint8_t *confirmBackground() {
-  if (settingsPosition == 6) {
-    return confirmSelection == 0 ? CONFIRM_RESTORE_NO : CONFIRM_RESTORE_YES;
-  }
   return confirmSelection == 0 ? CONFIRM_REBOOT_NO : CONFIRM_REBOOT_YES;
 }
 
 void drawNumberEditScreen() {
-  const bool editingMaximumEmpty = settingsPosition == 4;
   display.drawBitmap(0, 0,
-                     editingMaximumEmpty ? NUMBER_MAX_EMPTY
-                                         : NUMBER_CALIBRATION,
+                     NUMBER_MAX_EMPTY,
                      kScreenWidth, kScreenHeight, SSD1306_WHITE);
 
-  if (editingMaximumEmpty) {
-    drawDigit((numberEditValue / 100) % 10, 50, 37, false);
-    drawDigit((numberEditValue / 10) % 10, 60, 37, false);
-    drawDigit(numberEditValue % 10, 70, 37, false);
-  } else {
-    drawDigit((numberEditValue / 10) % 10, 55, 37, false);
-    drawDigit(numberEditValue % 10, 65, 37, false);
+  if (settingsPosition == 2) {
+    display.fillRect(0, 0, kScreenWidth, 25, SSD1306_WHITE);
+    drawSettingsLine("MAKSYMALNY CZAS", 19, 4, SSD1306_BLACK,
+                     SSD1306_WHITE);
+    drawSettingsLine("NAPELNIANIA", 31, 12, SSD1306_BLACK, SSD1306_WHITE,
+                     0, 0, 1UL << 4);
   }
+
+  drawDigit((numberEditValue / 100) % 10, 50, 37, false);
+  drawDigit((numberEditValue / 10) % 10, 60, 37, false);
+  drawDigit(numberEditValue % 10, 70, 37, false);
 }
 
 bool pollDebouncedButton(DebouncedButton &button, uint32_t now) {
@@ -267,26 +319,17 @@ void selectSettingsItem() {
       returnHomeScreen();
       return;
     case 1:
-      boolEditSelection = config.calibration_at_boot ? 1 : 0;
-      currentScreen = SCREEN_SETTINGS_BOOL_EDIT;
-      break;
+      timeCalibrationStart();
+      return;
     case 2:
-      boolEditSelection = config.calibration_before_procedure ? 1 : 0;
-      currentScreen = SCREEN_SETTINGS_BOOL_EDIT;
+      numberEditValue = config.max_fill_time;
+      currentScreen = SCREEN_SETTINGS_NUMBER_EDIT;
       break;
     case 3:
-      procedureStartCalibrationOnly();
-      return;
-    case 4:
       numberEditValue = config.max_empty_time;
       currentScreen = SCREEN_SETTINGS_NUMBER_EDIT;
       break;
-    case 5:
-      numberEditValue = config.calibration_time;
-      currentScreen = SCREEN_SETTINGS_NUMBER_EDIT;
-      break;
-    case 6:
-    case 7:
+    case 4:
       confirmSelection = 0;
       currentScreen = SCREEN_SETTINGS_CONFIRM;
       break;
@@ -301,24 +344,19 @@ enum EncoderRotationResult {
 };
 
 EncoderRotationResult handleRotation(int8_t direction) {
-  if (currentScreen == SCREEN_STATUS) {
+  if (currentScreen == SCREEN_STATUS ||
+      currentScreen == SCREEN_TIME_CALIBRATION) {
     return ENCODER_ACTION_IGNORED;
   }
 
   if (currentScreen == SCREEN_SETTINGS) {
     const int nextPosition = static_cast<int>(settingsPosition) + direction;
-    if (nextPosition < 0 || nextPosition > 7) {
+    if (nextPosition < 0 || nextPosition > 4) {
       return ENCODER_ACTION_LIMIT;
     }
     settingsPosition = static_cast<uint8_t>(nextPosition);
-  } else if (currentScreen == SCREEN_SETTINGS_BOOL_EDIT) {
-    const int nextSelection = static_cast<int>(boolEditSelection) + direction;
-    if (nextSelection < 0 || nextSelection > 1) {
-      return ENCODER_ACTION_LIMIT;
-    }
-    boolEditSelection = static_cast<uint8_t>(nextSelection);
   } else if (currentScreen == SCREEN_SETTINGS_NUMBER_EDIT) {
-    const uint32_t maximum = settingsPosition == 4 ? 999 : 99;
+    const uint32_t maximum = settingsPosition == 2 ? 100 : 999;
     const int64_t nextValue = static_cast<int64_t>(numberEditValue) + direction;
     if (nextValue < 1 || nextValue > maximum) {
       return ENCODER_ACTION_LIMIT;
@@ -338,12 +376,24 @@ EncoderRotationResult handleRotation(int8_t direction) {
     config.cycles = static_cast<uint8_t>(nextValue);
   } else if (selectedOption == 1) {
     const int32_t nextValue = static_cast<int32_t>(config.fill_time) + direction;
-    if (nextValue < 1 || nextValue > 999) {
+    const uint32_t maximum =
+        static_cast<uint32_t>(config.max_fill_time) * 10;
+    const uint32_t boundedMaximum = maximum < 999 ? maximum : 999;
+    if (nextValue < 1 || nextValue > boundedMaximum) {
       return ENCODER_ACTION_LIMIT;
     }
     config.fill_time = static_cast<uint16_t>(nextValue);
+  } else if (selectedOption == 2) {
+    const int32_t nextValue = static_cast<int32_t>(config.empty_time) + direction;
+    const uint32_t maximum =
+        static_cast<uint32_t>(config.max_empty_time) * 10;
+    const uint32_t boundedMaximum = maximum < 999 ? maximum : 999;
+    if (nextValue < 1 || nextValue > boundedMaximum) {
+      return ENCODER_ACTION_LIMIT;
+    }
+    config.empty_time = static_cast<uint16_t>(nextValue);
   } else {
-    cursorPosition = (cursorPosition + direction + 3) % 3;
+    cursorPosition = (cursorPosition + direction + 4) % 4;
   }
 
   markScreenDirty();
@@ -355,28 +405,30 @@ bool handleButtonPress() {
     return false;
   }
 
+  if (currentScreen == SCREEN_TIME_CALIBRATION) {
+    return timeCalibrationNextStep();
+  }
+
   if (currentScreen == SCREEN_SETTINGS) {
     selectSettingsItem();
     return true;
   }
 
-  if (currentScreen == SCREEN_SETTINGS_BOOL_EDIT) {
-    const bool value = boolEditSelection != 0;
-    if (settingsPosition == 1) {
-      config.calibration_at_boot = value;
-    } else {
-      config.calibration_before_procedure = value;
-    }
-    configStoreRequestSave();
-    returnToSettings();
-    return true;
-  }
-
   if (currentScreen == SCREEN_SETTINGS_NUMBER_EDIT) {
-    if (settingsPosition == 4) {
-      config.max_empty_time = numberEditValue;
+    if (settingsPosition == 2) {
+      config.max_fill_time = static_cast<uint16_t>(numberEditValue);
+      const uint16_t maximum =
+          static_cast<uint16_t>(config.max_fill_time * 10UL);
+      if (config.fill_time > maximum) {
+        config.fill_time = maximum > 999 ? 999 : maximum;
+      }
     } else {
-      config.calibration_time = numberEditValue;
+      config.max_empty_time = numberEditValue;
+      const uint16_t maximum =
+          static_cast<uint16_t>(config.max_empty_time * 10UL);
+      if (config.empty_time > maximum) {
+        config.empty_time = maximum > 999 ? 999 : maximum;
+      }
     }
     configStoreRequestSave();
     returnToSettings();
@@ -389,12 +441,6 @@ bool handleButtonPress() {
       return true;
     }
 
-    if (settingsPosition == 6) {
-      restoreDefaultConfig();
-      returnToSettings();
-      return true;
-    }
-
     procedureRequestSoftwareReset();
     return false;
   }
@@ -403,7 +449,7 @@ bool handleButtonPress() {
     if (selectedOption >= 0) {
       selectedOption = -1;
       configStoreRequestSave();
-    } else if (cursorPosition == 2) {
+    } else if (cursorPosition == 3) {
       currentScreen = SCREEN_SETTINGS;
     } else {
       selectedOption = cursorPosition;
@@ -416,7 +462,8 @@ bool handleButtonPress() {
 }
 
 void pollEncoder() {
-  if (currentScreen == SCREEN_STATUS) {
+  if (currentScreen == SCREEN_STATUS ||
+      currentScreen == SCREEN_TIME_CALIBRATION) {
     previousEncoderState = readEncoderState();
     encoderAccumulator = 0;
     return;
@@ -468,9 +515,86 @@ void pollEncoderButton() {
   }
 }
 
+void resetTimeCalibrationState() {
+  timeCalibrationStep = 0;
+  fillCalibrationElapsedMs = 0;
+  emptyCalibrationElapsedMs = 0;
+  fillCalibrationStartedAt = 0;
+  emptyCalibrationStartedAt = 0;
+  fillCalibrationButtonActive = false;
+  emptyCalibrationButtonActive = false;
+  displayedCalibrationTenths = UINT16_MAX;
+}
+
+uint16_t measuredTimeTenths(uint32_t milliseconds) {
+  const uint32_t tenths = (milliseconds + 50) / 100;
+  return static_cast<uint16_t>(tenths > 999 ? 999 : tenths);
+}
+
+void accumulateCalibrationHold(uint32_t now, bool filling) {
+  bool &buttonActive =
+      filling ? fillCalibrationButtonActive : emptyCalibrationButtonActive;
+  uint32_t &elapsed =
+      filling ? fillCalibrationElapsedMs : emptyCalibrationElapsedMs;
+  uint32_t &startedAt =
+      filling ? fillCalibrationStartedAt : emptyCalibrationStartedAt;
+  if (buttonActive) {
+    const uint64_t total = static_cast<uint64_t>(elapsed) + (now - startedAt);
+    elapsed = total > 99900 ? 99900 : static_cast<uint32_t>(total);
+    buttonActive = false;
+  }
+  procedureSetManualOutputs(false, false);
+}
+
+uint16_t currentCalibrationDisplayTenths(uint32_t now) {
+  const bool filling = timeCalibrationStep == 2;
+  const uint32_t elapsed =
+      filling ? fillCalibrationElapsedMs : emptyCalibrationElapsedMs;
+  const bool buttonActive =
+      filling ? fillCalibrationButtonActive : emptyCalibrationButtonActive;
+  const uint32_t startedAt =
+      filling ? fillCalibrationStartedAt : emptyCalibrationStartedAt;
+  const uint64_t total =
+      static_cast<uint64_t>(elapsed) +
+      (buttonActive ? static_cast<uint32_t>(now - startedAt) : 0);
+  const uint32_t boundedTotal = total > 99900 ? 99900 : total;
+  return measuredTimeTenths(boundedTotal);
+}
+
+void updateHomeManualControls() {
+  const bool fillPressed = digitalRead(kFillButtonPin) == LOW;
+  const bool emptyPressed = digitalRead(kEmptyButtonPin) == LOW;
+
+  if (currentScreen != SCREEN_HOME) {
+    if (homeManualOutputMode != 0) {
+      procedureSetManualOutputs(false, false);
+      homeManualOutputMode = 0;
+    }
+    homeManualLockout = true;
+    return;
+  }
+
+  if (homeManualLockout) {
+    if (!fillPressed && !emptyPressed) {
+      homeManualLockout = false;
+    } else {
+      return;
+    }
+  }
+
+  const uint8_t requestedMode =
+      fillPressed == emptyPressed ? 0 : (fillPressed ? 1 : 2);
+  if (requestedMode == homeManualOutputMode) {
+    return;
+  }
+
+  procedureSetManualOutputs(requestedMode == 1, requestedMode == 2);
+  homeManualOutputMode = requestedMode;
+}
+
 }  // namespace
 
-const Config defaultConfig = {1, 50, false, true, 30, 500, 10, 0, false};
+const Config defaultConfig = {1, 50, 100, 300, 30, 500, 0, false};
 Config config = defaultConfig;
 int currentScreen = SCREEN_HOME;
 
@@ -484,6 +608,8 @@ void uiBegin() {
   pinMode(kEncoderButtonPin, INPUT_PULLUP);
   pinMode(kStartButtonPin, INPUT_PULLUP);
   pinMode(kStopButtonPin, INPUT_PULLUP);
+  pinMode(kFillButtonPin, INPUT_PULLUP);
+  pinMode(kEmptyButtonPin, INPUT_PULLUP);
 
   previousEncoderState = readEncoderState();
   lastButtonReading = digitalRead(kEncoderButtonPin);
@@ -506,13 +632,20 @@ void processInput() {
   const bool startPressed = pollDebouncedButton(startButton, now);
 
   if (stopPressed) {
+    homeManualLockout = true;
+    homeManualOutputMode = 0;
     procedureStop();
+  } else if (currentScreen == SCREEN_TIME_CALIBRATION) {
+    timeCalibrationUpdate();
   } else if (startPressed) {
     procedureStart();
   }
 
-  pollEncoder();
-  pollEncoderButton();
+  if (!stopPressed) {
+    pollEncoder();
+    pollEncoderButton();
+  }
+  updateHomeManualControls();
 }
 
 void showStatusScreen(StatusPhase phase, uint8_t currentCycle,
@@ -542,15 +675,115 @@ void updateStatusScreen(StatusPhase phase, uint8_t currentCycle,
 }
 
 void returnHomeScreen() {
+  if (currentScreen == SCREEN_TIME_CALIBRATION) {
+    procedureSetManualOutputs(false, false);
+    resetTimeCalibrationState();
+  }
   currentScreen = SCREEN_HOME;
   selectedOption = -1;
   cursorPosition = 0;
   screenDirty = true;
 }
 
-void restoreDefaultConfig() {
-  config = defaultConfig;
-  configStoreRequestSave();
+void timeCalibrationStart() {
+  procedureSetManualOutputs(false, false);
+  resetTimeCalibrationState();
+  timeCalibrationStep = 1;
+  currentScreen = SCREEN_TIME_CALIBRATION;
+  markScreenDirty();
+}
+
+void timeCalibrationStop() {
+  procedureSetManualOutputs(false, false);
+  resetTimeCalibrationState();
+  homeManualLockout = true;
+  currentScreen = SCREEN_HOME;
+  selectedOption = -1;
+  cursorPosition = 0;
+  markScreenDirty();
+}
+
+bool timeCalibrationNextStep() {
+  const uint32_t now = millis();
+  if (timeCalibrationStep == 1) {
+    timeCalibrationStep = 2;
+    fillCalibrationElapsedMs = 0;
+    markScreenDirty();
+    return true;
+  }
+
+  if (timeCalibrationStep == 2) {
+    accumulateCalibrationHold(now, true);
+    const uint16_t measuredTime =
+        measuredTimeTenths(fillCalibrationElapsedMs);
+    if (measuredTime == 0) {
+      procedureEncoderErrorBeep();
+      return false;
+    }
+    config.fill_time = measuredTime;
+    const uint16_t requiredMaximum =
+        static_cast<uint16_t>((measuredTime + 9) / 10);
+    if (config.max_fill_time < requiredMaximum) {
+      config.max_fill_time = requiredMaximum;
+    }
+    configStoreRequestSave();
+    timeCalibrationStep = 3;
+    emptyCalibrationElapsedMs = 0;
+    markScreenDirty();
+    return true;
+  }
+
+  if (timeCalibrationStep == 3) {
+    accumulateCalibrationHold(now, false);
+    const uint16_t measuredTime =
+        measuredTimeTenths(emptyCalibrationElapsedMs);
+    if (measuredTime == 0) {
+      procedureEncoderErrorBeep();
+      return false;
+    }
+    config.empty_time = measuredTime;
+    const uint16_t requiredMaximum =
+        static_cast<uint16_t>((measuredTime + 9) / 10);
+    if (config.max_empty_time < requiredMaximum) {
+      config.max_empty_time = requiredMaximum;
+    }
+    configStoreRequestSave();
+    timeCalibrationStop();
+    return true;
+  }
+
+  return false;
+}
+
+void timeCalibrationUpdate() {
+  const uint32_t now = millis();
+  if (timeCalibrationStep == 2) {
+    const bool pressed = digitalRead(kFillButtonPin) == LOW;
+    if (pressed && !fillCalibrationButtonActive) {
+      fillCalibrationButtonActive = true;
+      fillCalibrationStartedAt = now;
+      procedureSetManualOutputs(true, false);
+    } else if (!pressed && fillCalibrationButtonActive) {
+      accumulateCalibrationHold(now, true);
+    }
+  } else if (timeCalibrationStep == 3) {
+    const bool pressed = digitalRead(kEmptyButtonPin) == LOW;
+    if (pressed && !emptyCalibrationButtonActive) {
+      emptyCalibrationButtonActive = true;
+      emptyCalibrationStartedAt = now;
+      procedureSetManualOutputs(false, true);
+    } else if (!pressed && emptyCalibrationButtonActive) {
+      accumulateCalibrationHold(now, false);
+    }
+  }
+
+  if (timeCalibrationStep == 2 || timeCalibrationStep == 3) {
+    const uint16_t tenths = currentCalibrationDisplayTenths(now);
+    if (tenths != displayedCalibrationTenths) {
+      displayedCalibrationTenths = tenths;
+      markScreenDirty();
+    }
+  }
 }
 
 void updateScreen() {
@@ -565,12 +798,7 @@ void updateScreen() {
 
   display.clearDisplay();
   if (currentScreen == SCREEN_SETTINGS) {
-    display.drawBitmap(0, 0, settingsMenuBackground(), kScreenWidth,
-                       kScreenHeight,
-                       SSD1306_WHITE);
-  } else if (currentScreen == SCREEN_SETTINGS_BOOL_EDIT) {
-    display.drawBitmap(0, 0, boolEditBackground(), kScreenWidth, kScreenHeight,
-                       SSD1306_WHITE);
+    drawSettingsMenu();
   } else if (currentScreen == SCREEN_SETTINGS_NUMBER_EDIT) {
     drawNumberEditScreen();
   } else if (currentScreen == SCREEN_SETTINGS_CONFIRM) {
@@ -578,6 +806,8 @@ void updateScreen() {
                        SSD1306_WHITE);
   } else if (currentScreen == SCREEN_STATUS) {
     drawStatusScreen();
+  } else if (currentScreen == SCREEN_TIME_CALIBRATION) {
+    drawTimeCalibrationScreen();
   } else {
     drawHomeScreen();
   }

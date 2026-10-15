@@ -3,8 +3,8 @@
 
 void procedureBegin();
 void procedureStart();
-void procedureStartCalibrationOnly();
 void procedureStop();
+void procedureSetManualOutputs(bool filling, bool emptying);
 void procedureUpdate();
 void procedureEncoderTurnBeep();
 void procedureEncoderPressBeep();

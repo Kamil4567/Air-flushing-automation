@@ -34,9 +34,6 @@ enum ProcedureStage : uint8_t {
   STAGE_CALIBRATION_ACTUATION,
   STAGE_CALIBRATION_SAMPLE,
   STAGE_CALIBRATION_SETTLE,
-  STAGE_INITIAL_EMPTY_ACTUATION,
-  STAGE_INITIAL_EMPTY_MONITOR,
-  STAGE_INITIAL_IDLE_SETTLE,
   STAGE_FILL_ACTUATION,
   STAGE_FILL_DURATION,
   STAGE_FILL_IDLE_SETTLE,
@@ -65,7 +62,6 @@ MachineState machineState = MACHINE_IDLE;
 ProcedureStage stage = STAGE_IDLE;
 Beeper beeper = {};
 bool procedureActive = false;
-bool bootCalibration = false;
 bool baselineValid = false;
 float calibrationBaselineMa = 0.0f;
 double calibrationCurrentSumMa = 0.0;
@@ -127,7 +123,7 @@ void setMachineState(MachineState nextState, uint32_t now) {
       break;
     case MACHINE_CALIBRATION:
       digitalWrite(kPumpPin, HIGH);
-      displayedPhase = STATUS_CALIBRATION;
+      displayedPhase = STATUS_EMPTY;
       break;
     case MACHINE_IDLE:
     default:
@@ -199,31 +195,17 @@ void updateBeeper(uint32_t now) {
 
 uint32_t calculateMaximumProcedureMs() {
   const uint64_t actuation = config.actuation_time;
-  const uint64_t emptyTimeout =
-      static_cast<uint64_t>(config.max_empty_time) * 1000;
+  const uint64_t emptyDuration =
+      static_cast<uint64_t>(config.empty_time) * 100;
   const uint64_t fillDuration =
       static_cast<uint64_t>(config.fill_time) * 100;
-  uint64_t total = actuation + emptyTimeout + actuation;
-
-  if (config.calibration_before_procedure) {
-    total += actuation +
-             static_cast<uint64_t>(config.calibration_time) * 1000 +
-             actuation;
-  }
-
-  total += static_cast<uint64_t>(config.cycles) *
-           (4 * actuation + fillDuration + emptyTimeout);
+  const uint64_t total = static_cast<uint64_t>(config.cycles) *
+                         (4 * actuation + fillDuration + emptyDuration);
 
   if (total > UINT32_MAX) {
     return UINT32_MAX;
   }
   return static_cast<uint32_t>(total);
-}
-
-void beginInitialEmpty(uint32_t now) {
-  setMachineState(MACHINE_EMPTY, now);
-  stage = STAGE_INITIAL_EMPTY_ACTUATION;
-  stageDeadline = now + config.actuation_time;
 }
 
 void beginCycleFill(uint32_t now) {
@@ -236,18 +218,11 @@ void beginCycleFill(uint32_t now) {
   stageDeadline = now + config.actuation_time;
 }
 
-void beginPumpMonitor(uint32_t now, bool initialEmpty) {
+void beginPumpMonitor(uint32_t now) {
   emptyStartedAt = now;
   lastCurrentSampleAt = now - kCurrentSampleIntervalMs;
   consecutiveAboveBaseline = 0;
-  stage = initialEmpty ? STAGE_INITIAL_EMPTY_MONITOR
-                       : STAGE_CYCLE_EMPTY_MONITOR;
-}
-
-void completeInitialEmpty(uint32_t now) {
-  setMachineState(MACHINE_IDLE, now);
-  stage = STAGE_INITIAL_IDLE_SETTLE;
-  stageDeadline = now + config.actuation_time;
+  stage = STAGE_CYCLE_EMPTY_MONITOR;
 }
 
 void completeCycleEmpty(uint32_t now) {
@@ -259,7 +234,6 @@ void completeCycleEmpty(uint32_t now) {
 void finishProcedure(uint32_t now) {
   setMachineState(MACHINE_IDLE, now);
   procedureActive = false;
-  bootCalibration = false;
   stage = STAGE_IDLE;
   startBeepPattern(1, kLongBeepMs, 0, now);
   returnHomeScreen();
@@ -282,20 +256,11 @@ void finishCalibration(uint32_t now) {
   }
 
   setMachineState(MACHINE_IDLE, now);
-  if (bootCalibration) {
-    procedureActive = false;
-    bootCalibration = false;
-    stage = STAGE_IDLE;
-    startBeepPattern(1, kShortBeepMs, 0, now);
-    returnHomeScreen();
-  } else {
-    stage = STAGE_CALIBRATION_SETTLE;
-    stageDeadline = now + config.actuation_time;
-  }
+  stage = STAGE_CALIBRATION_SETTLE;
+  stageDeadline = now + config.actuation_time;
 }
 
-void startCalibration(bool isBootCalibration, uint32_t now) {
-  bootCalibration = isBootCalibration;
+void startCalibration(uint32_t now) {
   calibrationCurrentSumMa = 0.0;
   calibrationSampleCount = 0;
   baselineValid = false;
@@ -338,7 +303,7 @@ void updateCalibration(uint32_t now) {
       return;
     }
     stage = STAGE_CALIBRATION_SAMPLE;
-    stageDeadline = now + config.calibration_time * 1000UL;
+    stageDeadline = now + 10UL * 1000;
     lastCurrentSampleAt = now - kCurrentSampleIntervalMs;
   }
 
@@ -358,20 +323,16 @@ void updateCalibration(uint32_t now) {
   }
 }
 
-void updatePumpMonitor(uint32_t now, bool initialEmpty) {
+void updatePumpMonitor(uint32_t now) {
   const bool cutoffDetected =
       kEnablePumpCutoffDetection && pollPumpCurrent(now);
   const bool timedOut =
-      now - emptyStartedAt >= config.max_empty_time * 1000UL;
+      now - emptyStartedAt >= config.empty_time * 100UL;
   if (!cutoffDetected && !timedOut) {
     return;
   }
 
-  if (initialEmpty) {
-    completeInitialEmpty(now);
-  } else {
-    completeCycleEmpty(now);
-  }
+  completeCycleEmpty(now);
 }
 
 void updateProcedureStage(uint32_t now) {
@@ -382,36 +343,12 @@ void updateProcedureStage(uint32_t now) {
       break;
 
     case STAGE_START_PENDING:
-      if (bootCalibration || config.calibration_before_procedure) {
-        startCalibration(bootCalibration, now);
-      } else {
-        beginInitialEmpty(now);
-      }
+      beginCycleFill(now);
       break;
 
     case STAGE_CALIBRATION_SETTLE:
       if (deadlineReached(now, stageDeadline)) {
-        beginInitialEmpty(now);
-      }
-      break;
-
-    case STAGE_INITIAL_EMPTY_ACTUATION:
-      if (deadlineReached(now, stageDeadline)) {
-        beginPumpMonitor(now, true);
-      }
-      break;
-
-    case STAGE_INITIAL_EMPTY_MONITOR:
-      updatePumpMonitor(now, true);
-      break;
-
-    case STAGE_INITIAL_IDLE_SETTLE:
-      if (deadlineReached(now, stageDeadline)) {
-        if (config.cycles == 0) {
-          finishProcedure(now);
-        } else {
-          beginCycleFill(now);
-        }
+        beginCycleFill(now);
       }
       break;
 
@@ -440,12 +377,12 @@ void updateProcedureStage(uint32_t now) {
 
     case STAGE_CYCLE_EMPTY_ACTUATION:
       if (deadlineReached(now, stageDeadline)) {
-        beginPumpMonitor(now, false);
+        beginPumpMonitor(now);
       }
       break;
 
     case STAGE_CYCLE_EMPTY_MONITOR:
-      updatePumpMonitor(now, false);
+      updatePumpMonitor(now);
       break;
 
     case STAGE_CYCLE_IDLE_SETTLE:
@@ -485,18 +422,6 @@ void procedureBegin() {
   };
   startBeepSequence(bootMelody, 4, now);
 
-  if (config.calibration_at_boot) {
-    procedureActive = true;
-    procedureStartedAt = now;
-    maximumProcedureMs = config.actuation_time +
-                        config.calibration_time * 1000UL;
-    currentCycle = 0;
-    lastDisplayedSecond = UINT32_MAX;
-    showStatusScreen(STATUS_CALIBRATION, currentCycle, config.cycles, 0,
-                     roundedSeconds(maximumProcedureMs));
-    bootCalibration = true;
-    stage = STAGE_START_PENDING;
-  }
 }
 
 void procedureStart() {
@@ -506,37 +431,15 @@ void procedureStart() {
 
   const uint32_t now = millis();
   procedureActive = true;
-  bootCalibration = false;
   procedureStartedAt = now;
   maximumProcedureMs = calculateMaximumProcedureMs();
   currentCycle = 0;
   lastDisplayedSecond = UINT32_MAX;
   startBeepPattern(1, kShortBeepMs, 0, now);
 
-  const StatusPhase initialPhase = config.calibration_before_procedure
-                                      ? STATUS_CALIBRATION
-                                      : STATUS_EMPTY;
-  displayedPhase = initialPhase;
-  showStatusScreen(initialPhase, currentCycle, config.cycles, 0,
+  displayedPhase = STATUS_FILL;
+  showStatusScreen(STATUS_FILL, 1, config.cycles, 0,
                    statusMaximumSeconds());
-  stage = STAGE_START_PENDING;
-}
-
-void procedureStartCalibrationOnly() {
-  if (procedureActive) {
-    return;
-  }
-
-  const uint32_t now = millis();
-  procedureActive = true;
-  bootCalibration = true;
-  procedureStartedAt = now;
-  maximumProcedureMs = config.actuation_time +
-                       config.calibration_time * 1000UL;
-  currentCycle = 0;
-  lastDisplayedSecond = UINT32_MAX;
-  showStatusScreen(STATUS_CALIBRATION, currentCycle, config.cycles, 0,
-                   roundedSeconds(maximumProcedureMs));
   stage = STAGE_START_PENDING;
 }
 
@@ -572,11 +475,20 @@ void procedureStop() {
   }
 
   procedureActive = false;
-  bootCalibration = false;
   stage = STAGE_IDLE;
   setMachineState(MACHINE_IDLE, now);
   startBeepPattern(5, kFastBeepMs, kFastBeepGapMs, now);
   returnHomeScreen();
+}
+
+void procedureSetManualOutputs(bool filling, bool emptying) {
+  if (filling && !emptying) {
+    setMachineState(MACHINE_FILL, millis());
+  } else if (emptying && !filling) {
+    setMachineState(MACHINE_EMPTY, millis());
+  } else {
+    setMachineState(MACHINE_IDLE, millis());
+  }
 }
 
 void procedureUpdate() {

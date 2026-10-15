@@ -10,11 +10,27 @@
 namespace {
 
 constexpr uint32_t kRecordMagic = 0x43464731;
-constexpr uint16_t kRecordVersion = 1;
+constexpr uint16_t kRecordVersion = 2;
+constexpr uint16_t kLegacyRecordVersion = 1;
 constexpr uint32_t kSaveDebounceMs = 750;
 constexpr size_t kEepromBufferSize = 256;
 
 struct ConfigRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint8_t cycles;
+  uint16_t fillTime;
+  uint16_t maxFillTime;
+  uint16_t emptyTime;
+  uint16_t maxEmptyTime;
+  uint32_t actuationTime;
+  uint16_t pumpCurrentBaselineTenthsMa;
+  uint8_t pumpCurrentBaselineValid;
+  uint32_t crc;
+};
+
+struct LegacyConfigRecord {
   uint32_t magic;
   uint16_t version;
   uint16_t size;
@@ -51,6 +67,19 @@ uint32_t calculateCrc32(const uint8_t *data, size_t length) {
 bool configValuesValid(const ConfigRecord &record) {
   return record.cycles >= 1 && record.cycles <= 99 &&
          record.fillTime >= 1 && record.fillTime <= 999 &&
+         record.maxFillTime >= 1 && record.maxFillTime <= 100 &&
+         record.emptyTime >= 1 && record.emptyTime <= 999 &&
+         record.maxEmptyTime >= 1 && record.maxEmptyTime <= 999 &&
+         record.emptyTime <= record.maxEmptyTime * 10UL &&
+         record.fillTime <= record.maxFillTime * 10UL &&
+         record.actuationTime >= 1 && record.actuationTime <= 60000 &&
+         record.pumpCurrentBaselineValid <= 1 &&
+         record.pumpCurrentBaselineTenthsMa <= 30000;
+}
+
+bool legacyConfigValuesValid(const LegacyConfigRecord &record) {
+  return record.cycles >= 1 && record.cycles <= 99 &&
+         record.fillTime >= 1 && record.fillTime <= 999 &&
          record.calibrationAtBoot <= 1 &&
          record.calibrationBeforeProcedure <= 1 &&
          record.maxEmptyTime >= 1 && record.maxEmptyTime <= 999 &&
@@ -60,29 +89,56 @@ bool configValuesValid(const ConfigRecord &record) {
          record.pumpCurrentBaselineTenthsMa <= 30000;
 }
 
-bool recordValid(const ConfigRecord &record) {
+template <typename Record>
+bool recordCrcValid(const Record &record) {
   const uint32_t expectedCrc = calculateCrc32(
       reinterpret_cast<const uint8_t *>(&record),
-      offsetof(ConfigRecord, crc));
+      offsetof(Record, crc));
+  return record.crc == expectedCrc;
+}
+
+bool recordValid(const ConfigRecord &record) {
   return record.magic == kRecordMagic &&
          record.version == kRecordVersion &&
          record.size == sizeof(ConfigRecord) &&
-         record.crc == expectedCrc &&
+         recordCrcValid(record) &&
          configValuesValid(record);
+}
+
+bool legacyRecordValid(const LegacyConfigRecord &record) {
+  return record.magic == kRecordMagic &&
+         record.version == kLegacyRecordVersion &&
+         record.size == sizeof(LegacyConfigRecord) &&
+         recordCrcValid(record) &&
+         legacyConfigValuesValid(record);
 }
 
 void recordToConfig(const ConfigRecord &record, Config *config) {
   config->cycles = record.cycles;
   config->fill_time = record.fillTime;
-  config->calibration_at_boot = record.calibrationAtBoot != 0;
-  config->calibration_before_procedure =
-      record.calibrationBeforeProcedure != 0;
+  config->max_fill_time = record.maxFillTime;
+  config->empty_time = record.emptyTime;
   config->max_empty_time = record.maxEmptyTime;
   config->actuation_time = record.actuationTime;
-  config->calibration_time = record.calibrationTime;
   config->pump_current_baseline_tenths_ma =
       record.pumpCurrentBaselineTenthsMa;
   config->pump_current_baseline_valid =
+      record.pumpCurrentBaselineValid != 0;
+}
+
+void migrateLegacyRecord(const LegacyConfigRecord &record) {
+  config = defaultConfig;
+  config.cycles = record.cycles;
+  config.fill_time = record.fillTime;
+  const uint32_t migratedEmptyTime = record.maxEmptyTime * 10UL;
+  config.empty_time = migratedEmptyTime > 999
+                          ? 999
+                          : static_cast<uint16_t>(migratedEmptyTime);
+  config.max_empty_time = static_cast<uint16_t>(record.maxEmptyTime);
+  config.actuation_time = record.actuationTime;
+  config.pump_current_baseline_tenths_ma =
+      record.pumpCurrentBaselineTenthsMa;
+  config.pump_current_baseline_valid =
       record.pumpCurrentBaselineValid != 0;
 }
 
@@ -93,12 +149,10 @@ ConfigRecord configToRecord() {
   record.size = sizeof(ConfigRecord);
   record.cycles = config.cycles;
   record.fillTime = config.fill_time;
-  record.calibrationAtBoot = config.calibration_at_boot ? 1 : 0;
-  record.calibrationBeforeProcedure =
-      config.calibration_before_procedure ? 1 : 0;
+  record.maxFillTime = config.max_fill_time;
+  record.emptyTime = config.empty_time;
   record.maxEmptyTime = config.max_empty_time;
   record.actuationTime = config.actuation_time;
-  record.calibrationTime = config.calibration_time;
   record.pumpCurrentBaselineTenthsMa =
       config.pump_current_baseline_tenths_ma;
   record.pumpCurrentBaselineValid =
@@ -120,7 +174,13 @@ void configStoreBegin() {
   if (recordValid(record)) {
     recordToConfig(record, &config);
   } else {
-    config = defaultConfig;
+    LegacyConfigRecord legacyRecord = {};
+    EEPROM.get(0, legacyRecord);
+    if (legacyRecordValid(legacyRecord)) {
+      migrateLegacyRecord(legacyRecord);
+    } else {
+      config = defaultConfig;
+    }
     configStoreRequestSave();
   }
 }
