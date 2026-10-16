@@ -4,6 +4,9 @@
 #define INA219_CURRENT_REGISTER 0x04
 #define INA219_CURRENT_LSB_MA 0.1f
 
+// Odczytuje rejestr prądu INA219, interpretuje go jako signed i przelicza na mA.
+// Argumenty: wskaźnik na zmienną wyniku. Zwraca: powodzenie odczytu; przy sukcesie
+// zapisuje prąd do *current_ma, a przy błędzie nie modyfikuje wyniku.
 bool ina219_read_current_ma(float *current_ma) {
   uint16_t raw_value;
 

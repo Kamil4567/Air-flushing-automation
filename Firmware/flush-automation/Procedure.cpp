@@ -76,22 +76,33 @@ uint8_t currentCycle = 0;
 uint8_t consecutiveAboveBaseline = 0;
 StatusPhase displayedPhase = STATUS_EMPTY;
 
+// Sprawdza osiągnięcie terminu z uwzględnieniem przepełnienia licznika millis().
+// Argumenty: bieżący czas i termin w ms. Zwraca: true, gdy termin minął.
 bool deadlineReached(uint32_t now, uint32_t deadline) {
   return static_cast<int32_t>(now - deadline) >= 0;
 }
 
+// Zaokrągla liczbę milisekund w górę do pełnych sekund.
+// Argumenty: czas w ms. Zwraca: zaokrąglony czas w sekundach.
 uint32_t roundedSeconds(uint32_t milliseconds) {
   return (milliseconds + 999) / 1000;
 }
 
+// Oblicza czas od rozpoczęcia bieżącej procedury.
+// Argumenty: bieżący czas w ms. Zwraca: upływ czasu w pełnych sekundach.
 uint32_t procedureElapsedSeconds(uint32_t now) {
   return (now - procedureStartedAt) / 1000;
 }
 
+// Przelicza maksymalny czas procedury na sekundy do prezentacji.
+// Argumenty: brak. Zwraca: zaokrąglony limit czasu w sekundach.
 uint32_t statusMaximumSeconds() {
   return roundedSeconds(maximumProcedureMs);
 }
 
+// Przekazuje do UI fazę, cykl i czas, gdy zmieniła się sekunda lub wymuszono aktualizację.
+// Argumenty: bieżący czas w ms i opcjonalne wymuszenie. Zwraca: brak; może
+// aktualizować lastDisplayedSecond oraz dane ekranu statusu.
 void publishStatus(uint32_t now, bool force = false) {
   if (!procedureActive) {
     return;
@@ -105,6 +116,9 @@ void publishStatus(uint32_t now, bool force = false) {
   }
 }
 
+// Wyłącza wszystkie wyjścia, ustawia wyjścia właściwe dla stanu i publikuje fazę.
+// Argumenty: nowy stan maszyny i bieżący czas w ms. Zwraca: brak; zmienia GPIO,
+// machineState, displayedPhase i stan ekranu statusu.
 void setMachineState(MachineState nextState, uint32_t now) {
   digitalWrite(kPumpPin, LOW);
   digitalWrite(kZ1Pin, LOW);
@@ -133,6 +147,9 @@ void setMachineState(MachineState nextState, uint32_t now) {
   publishStatus(now, true);
 }
 
+// Kopiuje ograniczoną liczbę kroków dźwięku i rozpoczyna sekwencję bez blokowania.
+// Argumenty: tablica kroków, jej liczba oraz bieżący czas w ms.
+// Zwraca: brak; zastępuje bieżącą sekwencję i resetuje stan brzęczyka.
 void startBeepSequence(const BeepStep *steps, uint8_t count, uint32_t now) {
   noTone(kBuzzerPin);
   beeper.stepCount = count > kMaxBeepSteps ? kMaxBeepSteps : count;
@@ -146,6 +163,9 @@ void startBeepSequence(const BeepStep *steps, uint8_t count, uint32_t now) {
   beeper.rebootAfterSequence = false;
 }
 
+// Buduje powtarzany sygnał o częstotliwości 1 kHz i przekazuje go do odtwarzania.
+// Argumenty: liczba sygnałów, czas dźwięku, przerwa (ms) i bieżący czas (ms).
+// Zwraca: brak; zastępuje aktualną sekwencję brzęczyka.
 void startBeepPattern(uint8_t count, uint16_t onTimeMs,
                       uint16_t offTimeMs, uint32_t now) {
   BeepStep steps[kMaxBeepSteps];
@@ -156,6 +176,8 @@ void startBeepPattern(uint8_t count, uint16_t onTimeMs,
   startBeepSequence(steps, stepCount, now);
 }
 
+// Wyłącza brzęczyk i wyjścia, po czym resetuje RP2040 przez watchdog.
+// Argumenty: brak. Nie zwraca; w razie powrotu watchdoga pozostaje w pętli.
 [[noreturn]] void performSoftwareReset() {
   noTone(kBuzzerPin);
   digitalWrite(kPumpPin, LOW);
@@ -166,6 +188,9 @@ void startBeepPattern(uint8_t count, uint16_t onTimeMs,
   }
 }
 
+// Wykonuje należną zmianę stanu sekwencji brzęczyka bez oczekiwania blokującego.
+// Argumenty: bieżący czas w ms. Zwraca: brak; zmienia brzęczyk i stan sekwencji,
+// a po sekwencji resetu może zresetować urządzenie.
 void updateBeeper(uint32_t now) {
   if (!beeper.active || !deadlineReached(now, beeper.nextChangeMs)) {
     return;
@@ -193,6 +218,8 @@ void updateBeeper(uint32_t now) {
   }
 }
 
+// Szacuje maksymalny czas wszystkich cykli na podstawie bieżącej konfiguracji.
+// Argumenty: brak. Zwraca: czas w ms ograniczony do zakresu uint32_t.
 uint32_t calculateMaximumProcedureMs() {
   const uint64_t actuation = config.actuation_time;
   const uint64_t emptyDuration =
@@ -208,6 +235,8 @@ uint32_t calculateMaximumProcedureMs() {
   return static_cast<uint32_t>(total);
 }
 
+// Rozpoczyna kolejny cykl: zwiększa licznik, sygnalizuje start i włącza napełnianie.
+// Argumenty: bieżący czas w ms. Zwraca: brak; zmienia cykl, wyjścia, etap i termin.
 void beginCycleFill(uint32_t now) {
   if (currentCycle < config.cycles) {
     ++currentCycle;
@@ -218,6 +247,8 @@ void beginCycleFill(uint32_t now) {
   stageDeadline = now + config.actuation_time;
 }
 
+// Inicjuje pomiar czasu opróżniania i próbkowanie prądu pompy.
+// Argumenty: bieżący czas w ms. Zwraca: brak; zeruje licznik próbek i zmienia etap.
 void beginPumpMonitor(uint32_t now) {
   emptyStartedAt = now;
   lastCurrentSampleAt = now - kCurrentSampleIntervalMs;
@@ -225,12 +256,16 @@ void beginPumpMonitor(uint32_t now) {
   stage = STAGE_CYCLE_EMPTY_MONITOR;
 }
 
+// Kończy opróżnianie i uruchamia przerwę przed następnym cyklem lub końcem.
+// Argumenty: bieżący czas w ms. Zwraca: brak; wyłącza wyjścia i ustawia etap/termin.
 void completeCycleEmpty(uint32_t now) {
   setMachineState(MACHINE_IDLE, now);
   stage = STAGE_CYCLE_IDLE_SETTLE;
   stageDeadline = now + config.actuation_time;
 }
 
+// Kończy procedurę, wyłącza wyjścia, sygnalizuje sukces i wraca do ekranu głównego.
+// Argumenty: bieżący czas w ms. Zwraca: brak; dezaktywuje procedurę i resetuje etap.
 void finishProcedure(uint32_t now) {
   setMachineState(MACHINE_IDLE, now);
   procedureActive = false;
@@ -239,6 +274,9 @@ void finishProcedure(uint32_t now) {
   returnHomeScreen();
 }
 
+// Uśrednia zebrane próbki bazy prądu, zapisuje wynik i planuje dalszy przebieg.
+// Argumenty: bieżący czas w ms. Zwraca: brak; aktualizuje bazę, konfigurację,
+// żądanie zapisu, stan maszyny i etap kalibracji.
 void finishCalibration(uint32_t now) {
   if (calibrationSampleCount > 0) {
     calibrationBaselineMa = static_cast<float>(
@@ -260,6 +298,8 @@ void finishCalibration(uint32_t now) {
   stageDeadline = now + config.actuation_time;
 }
 
+// Rozpoczyna kalibrację bazy prądu: zeruje akumulację i włącza pompę.
+// Argumenty: bieżący czas w ms. Zwraca: brak; ustawia stan, etap i termin kalibracji.
 void startCalibration(uint32_t now) {
   calibrationCurrentSumMa = 0.0;
   calibrationSampleCount = 0;
@@ -270,6 +310,9 @@ void startCalibration(uint32_t now) {
   stageDeadline = now + config.actuation_time;
 }
 
+// Próbkuje prąd co 100 ms i sprawdza przekroczenie zapisanej bazy przez 3 próbki.
+// Argumenty: bieżący czas w ms. Zwraca: true po potwierdzonym przekroczeniu;
+// aktualizuje czas próbki i licznik kolejnych odczytów ponad bazą.
 bool pollPumpCurrent(uint32_t now) {
   if (now - lastCurrentSampleAt < kCurrentSampleIntervalMs) {
     return false;
@@ -297,6 +340,8 @@ bool pollPumpCurrent(uint32_t now) {
   return consecutiveAboveBaseline >= kCutoffConfirmSamples;
 }
 
+// Przeprowadza etapy rozruchu oraz 10-sekundowego próbkowania bazy prądu.
+// Argumenty: bieżący czas w ms. Zwraca: brak; zbiera próbki i może zakończyć kalibrację.
 void updateCalibration(uint32_t now) {
   if (stage == STAGE_CALIBRATION_ACTUATION) {
     if (!deadlineReached(now, stageDeadline)) {
@@ -323,6 +368,8 @@ void updateCalibration(uint32_t now) {
   }
 }
 
+// Kończy nadzór opróżniania po detekcji prądu albo po upływie limitu czasu.
+// Argumenty: bieżący czas w ms. Zwraca: brak; przy spełnieniu warunku przełącza etap.
 void updatePumpMonitor(uint32_t now) {
   const bool cutoffDetected =
       kEnablePumpCutoffDetection && pollPumpCurrent(now);
@@ -335,6 +382,8 @@ void updatePumpMonitor(uint32_t now) {
   completeCycleEmpty(now);
 }
 
+// Wykonuje przejście automatu procedury zależne od bieżącego etapu i terminów.
+// Argumenty: bieżący czas w ms. Zwraca: brak; aktualizuje etap, wyjścia, cykle i terminy.
 void updateProcedureStage(uint32_t now) {
   switch (stage) {
     case STAGE_CALIBRATION_ACTUATION:
@@ -403,6 +452,8 @@ void updateProcedureStage(uint32_t now) {
 
 }  // namespace
 
+// Inicjalizuje GPIO procedury, odtwarza bazę prądu z config i uruchamia melodię startową.
+// Argumenty: brak. Zwraca: brak; konfiguruje sprzęt oraz wewnętrzny stan procedury.
 void procedureBegin() {
   pinMode(kBuzzerPin, OUTPUT);
   pinMode(kZ1Pin, OUTPUT);
@@ -424,6 +475,8 @@ void procedureBegin() {
 
 }
 
+// Rozpoczyna procedurę, jeśli nie jest już aktywna, i przełącza UI na ekran statusu.
+// Argumenty: brak. Zwraca: brak; ustawia czas, limit, licznik cykli i etap startowy.
 void procedureStart() {
   if (procedureActive) {
     return;
@@ -443,16 +496,22 @@ void procedureStart() {
   stage = STAGE_START_PENDING;
 }
 
+// Uruchamia krótki sygnał potwierdzający obrót enkodera.
+// Argumenty: brak. Zwraca: brak; zastępuje bieżącą sekwencję brzęczyka.
 void procedureEncoderTurnBeep() {
   const BeepStep steps[] = {{2000, 30, 0}};
   startBeepSequence(steps, 1, millis());
 }
 
+// Uruchamia sygnał potwierdzający naciśnięcie enkodera.
+// Argumenty: brak. Zwraca: brak; zastępuje bieżącą sekwencję brzęczyka.
 void procedureEncoderPressBeep() {
   const BeepStep steps[] = {{2000, 80, 0}};
   startBeepSequence(steps, 1, millis());
 }
 
+// Uruchamia dwutonowy sygnał błędu lub próby wyjścia poza dozwolony zakres.
+// Argumenty: brak. Zwraca: brak; zastępuje bieżącą sekwencję brzęczyka.
 void procedureEncoderErrorBeep() {
   const BeepStep steps[] = {
       {800, 35, 45},
@@ -461,11 +520,15 @@ void procedureEncoderErrorBeep() {
   startBeepSequence(steps, 2, millis());
 }
 
+// Zleca reset programowy po zakończeniu krótkiego sygnału potwierdzenia.
+// Argumenty: brak. Zwraca: brak; ustawia flagę resetu w sekwencji brzęczyka.
 void procedureRequestSoftwareReset() {
   procedureEncoderPressBeep();
   beeper.rebootAfterSequence = true;
 }
 
+// Zatrzymuje procedurę, wyłącza wyjścia i wraca do ekranu głównego.
+// Argumenty: brak. Zwraca: brak; dezaktywuje automat i przy aktywnym cyklu sygnalizuje STOP.
 void procedureStop() {
   const uint32_t now = millis();
   if (!procedureActive) {
@@ -481,6 +544,8 @@ void procedureStop() {
   returnHomeScreen();
 }
 
+// Ustawia ręczny stan wyjść: napełnianie, opróżnianie albo bezczynność.
+// Argumenty: żądanie napełniania i opróżniania. Zwraca: brak; zmienia GPIO i stan maszyny.
 void procedureSetManualOutputs(bool filling, bool emptying) {
   if (filling && !emptying) {
     setMachineState(MACHINE_FILL, millis());
@@ -491,6 +556,8 @@ void procedureSetManualOutputs(bool filling, bool emptying) {
   }
 }
 
+// Aktualizuje brzęczyk i wykonuje bieżący etap automatu, jeśli procedura jest aktywna.
+// Argumenty: brak. Zwraca: brak; może zmieniać wyjścia, etapy i dane ekranu statusu.
 void procedureUpdate() {
   const uint32_t now = millis();
   updateBeeper(now);

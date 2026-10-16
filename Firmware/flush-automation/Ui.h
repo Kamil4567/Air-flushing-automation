@@ -31,19 +31,42 @@ extern Config config;
 extern const Config defaultConfig;
 extern int currentScreen;
 
+// Inicjalizuje I2C, wejścia użytkownika i wyświetlacz OLED.
+// Argumenty/wartość zwrotna: brak; konfiguruje sprzęt oraz stan UI.
 void uiBegin();
+// Wykonuje jeden przebieg obsługi przycisków, enkodera i przycisków ręcznych.
+// Argumenty/wartość zwrotna: brak; może zmieniać ekran, konfigurację i wyjścia.
 void processInput();
+// Rysuje zmieniony ekran, jeśli OLED jest gotowy i upłynął minimalny odstęp.
+// Argumenty/wartość zwrotna: brak; aktualizuje wyświetlacz i flagi odświeżenia.
 void updateScreen();
+// Przełącza UI na ekran statusu i ustawia początkowe dane procedury.
+// Argumenty: faza, numer bieżącego cyklu, liczba cykli, czas upływu i maksimum w sekundach.
+// Wartość zwrotna: brak; zmienia ekran oraz dane statusu.
 void showStatusScreen(StatusPhase phase, uint8_t currentCycle,
                       uint8_t allCycles, uint32_t elapsedSeconds,
                       uint32_t maximumSeconds);
+// Aktualizuje dane statusu, oznaczając ekran do odrysowania po wykryciu zmiany.
+// Argumenty: faza, numer bieżącego cyklu, liczba cykli, czas upływu i maksimum w sekundach.
+// Wartość zwrotna: brak; modyfikuje stan statusu i w razie potrzeby flagę rysowania.
 void updateStatusScreen(StatusPhase phase, uint8_t currentCycle,
                         uint8_t allCycles, uint32_t elapsedSeconds,
                         uint32_t maximumSeconds);
+// Wraca do ekranu głównego i czyści zaznaczenie oraz stan kalibracji, jeśli był aktywny.
+// Argumenty/wartość zwrotna: brak; zmienia stan ekranów i UI.
 void returnHomeScreen();
+// Rozpoczyna pomiar kalibracyjny czasów napełniania/opróżniania.
+// Argumenty/wartość zwrotna: brak; resetuje pomiary, wyłącza wyjścia i zmienia ekran.
 void timeCalibrationStart();
+// Kończy kalibrację, wyłącza ręczne wyjścia i wraca do ekranu głównego.
+// Argumenty/wartość zwrotna: brak; resetuje stan pomiaru i ustawia blokadę wejść.
 void timeCalibrationStop();
+// Zatwierdza pomiar albo przechodzi do kolejnego kroku kalibracji.
+// Argumenty: brak. Zwraca: true dla przyjętego kroku, false dla błędnego/nieaktywnego;
+// aktualizuje config i może zlecić jego zapis.
 bool timeCalibrationNextStep();
+// Odczytuje wejścia kalibracji, steruje wyjściami i odświeża licznik pomiaru.
+// Argumenty/wartość zwrotna: brak; aktualizuje stan kalibracji i UI.
 void timeCalibrationUpdate();
 
 #endif

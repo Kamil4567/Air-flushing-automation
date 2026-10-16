@@ -79,17 +79,23 @@ const int8_t kEncoderTransitions[16] = {
   0, 1, -1, 0
 };
 
+// Odczytuje stan dwóch kanałów enkodera jako dwubitową wartość.
+// Argumenty: brak. Zwraca: aktualny stan CLK i DT; nie zmienia stanu UI.
 uint8_t readEncoderState() {
   return (static_cast<uint8_t>(digitalRead(kEncoderClockPin)) << 1) |
          static_cast<uint8_t>(digitalRead(kEncoderDataPin));
 }
 
+// Oznacza ekran jako wymagający ponownego narysowania.
+// Argumenty: brak. Zwraca: brak; ustawia flagę screenDirty.
 void markScreenDirty() {
   screenDirty = true;
 }
 
 uint16_t currentCalibrationDisplayTenths(uint32_t now);
 
+// Wybiera bitmapę ekranu głównego zgodnie z zaznaczonym polem lub kursorem.
+// Argumenty: brak. Zwraca: wskaźnik do bitmapy; nie zmienia stanu UI.
 const uint8_t *homeBackground() {
   if (selectedOption == 0) {
     return HOME_V2_SELECTED_0;
@@ -113,12 +119,17 @@ const uint8_t *homeBackground() {
   }
 }
 
+// Rysuje na OLED jedną cyfrę w podanej pozycji i opcjonalnie odwraca kolory.
+// Argumenty: cyfra (0–9), pozycja x/y i flaga inwersji. Zwraca: brak;
+// modyfikuje bufor wyświetlacza.
 void drawDigit(uint8_t digit, int16_t x, int16_t y, bool inverted) {
   const uint16_t foreground = inverted ? SSD1306_BLACK : SSD1306_WHITE;
   const uint16_t background = inverted ? SSD1306_WHITE : SSD1306_BLACK;
   display.drawBitmap(x, y, FONT_DIGITS[digit], 8, 12, foreground, background);
 }
 
+// Rysuje ekran główny z konfiguracją oraz zaznaczeniem aktywnego pola.
+// Argumenty: brak. Zwraca: brak; odczytuje config i modyfikuje bufor OLED.
 void drawHomeScreen() {
   display.drawBitmap(0, 0, homeBackground(), kScreenWidth, kScreenHeight,
                      SSD1306_WHITE);
@@ -138,6 +149,8 @@ void drawHomeScreen() {
   drawDigit(config.empty_time % 10, 40, 34, emptyTimeInverted);
 }
 
+// Rysuje ekran aktualnego kroku kalibracji czasu oraz wartość pomiaru.
+// Argumenty: brak. Zwraca: brak; odczytuje stan kalibracji i modyfikuje bufor OLED.
 void drawTimeCalibrationScreen() {
   const uint8_t *bitmap = TIME_CALIBRATION_STEP_1;
   if (timeCalibrationStep == 2) {
@@ -156,6 +169,8 @@ void drawTimeCalibrationScreen() {
   }
 }
 
+// Wybiera bitmapę tła statusu dla bieżącej fazy procedury.
+// Argumenty: brak. Zwraca: wskaźnik do bitmapy; nie zmienia stanu UI.
 const uint8_t *statusBackground() {
   switch (statusPhase) {
     case STATUS_FILL:
@@ -165,15 +180,22 @@ const uint8_t *statusBackground() {
   }
 }
 
+// Rysuje dwukropek w podanej pozycji na ekranie statusu.
+// Argumenty: współrzędne x/y. Zwraca: brak; modyfikuje bufor wyświetlacza.
 void drawTimeSeparator(int16_t x, int16_t y) {
   display.drawPixel(x, y + 3, SSD1306_WHITE);
   display.drawPixel(x, y + 8, SSD1306_WHITE);
 }
 
+// Rysuje ukośnik oddzielający czasy na ekranie statusu.
+// Argumenty: współrzędne x/y. Zwraca: brak; modyfikuje bufor wyświetlacza.
 void drawTimeSlash(int16_t x, int16_t y) {
   display.drawLine(x, y + 10, x + 5, y + 2, SSD1306_WHITE);
 }
 
+// Rysuje czas w formacie MM:SS albo H:MM:SS.
+// Argumenty: czas w sekundach, początek x, y i wybór formatu godzinowego.
+// Zwraca: brak; modyfikuje bufor wyświetlacza.
 void drawTimeDigits(uint32_t seconds, int16_t firstX, int16_t y,
                     bool includeHours) {
   if (includeHours) {
@@ -198,6 +220,8 @@ void drawTimeDigits(uint32_t seconds, int16_t firstX, int16_t y,
   drawDigit(remainingSeconds % 10, firstX + 33, y, false);
 }
 
+// Rysuje ekran statusu: fazę, numer cyklu, czasy i pasek postępu.
+// Argumenty: brak. Zwraca: brak; odczytuje stan statusu i modyfikuje bufor OLED.
 void drawStatusScreen() {
   display.drawBitmap(0, 0, statusBackground(), kScreenWidth, kScreenHeight,
                      SSD1306_WHITE);
@@ -238,6 +262,9 @@ void drawStatusScreen() {
   }
 }
 
+// Rysuje tekst ustawień i opcjonalne znaki diakrytyczne za pomocą masek bitowych.
+// Argumenty: tekst, pozycja, kolory oraz opcjonalne maski akcentów, kropek i ukośników.
+// Zwraca: brak; modyfikuje bufor wyświetlacza.
 void drawSettingsLine(const char *text, int16_t x, int16_t y,
                       uint16_t foreground, uint16_t background,
                       uint32_t acuteMask = 0, uint32_t dotMask = 0,
@@ -261,6 +288,8 @@ void drawSettingsLine(const char *text, int16_t x, int16_t y,
   }
 }
 
+// Rysuje stronę menu ustawień wybraną przez settingsPosition.
+// Argumenty: brak. Zwraca: brak; modyfikuje bufor wyświetlacza.
 void drawSettingsMenu() {
   static const uint8_t *const pages[] = {
       SETTINGS_V2_PAGE_0, SETTINGS_V2_PAGE_1, SETTINGS_V2_PAGE_2,
@@ -270,10 +299,14 @@ void drawSettingsMenu() {
                      kScreenHeight, SSD1306_WHITE);
 }
 
+// Zwraca bitmapę aktualnej odpowiedzi w dialogu resetu.
+// Argumenty: brak. Zwraca: wskaźnik do bitmapy „nie” lub „tak”.
 const uint8_t *confirmBackground() {
   return confirmSelection == 0 ? CONFIRM_REBOOT_NO : CONFIRM_REBOOT_YES;
 }
 
+// Rysuje ekran edycji limitu czasu napełniania albo opróżniania.
+// Argumenty: brak. Zwraca: brak; odczytuje stan edycji i modyfikuje bufor OLED.
 void drawNumberEditScreen() {
   display.drawBitmap(0, 0,
                      NUMBER_MAX_EMPTY,
@@ -292,6 +325,9 @@ void drawNumberEditScreen() {
   drawDigit(numberEditValue % 10, 70, 37, false);
 }
 
+// Odczytuje przycisk z eliminacją drgań styków i wykrywa zbocze wciśnięcia.
+// Argumenty: stan przycisku do aktualizacji i bieżący czas w ms.
+// Zwraca: true tylko przy potwierdzonym wciśnięciu; modyfikuje przekazany stan.
 bool pollDebouncedButton(DebouncedButton &button, uint32_t now) {
   const bool reading = digitalRead(button.pin);
   if (reading != button.lastReading) {
@@ -308,11 +344,15 @@ bool pollDebouncedButton(DebouncedButton &button, uint32_t now) {
   return button.stableState == LOW;
 }
 
+// Wraca do menu ustawień i wymusza odświeżenie ekranu.
+// Argumenty: brak. Zwraca: brak; zmienia currentScreen i screenDirty.
 void returnToSettings() {
   currentScreen = SCREEN_SETTINGS;
   screenDirty = true;
 }
 
+// Uruchamia akcję przypisaną do aktualnej pozycji menu ustawień.
+// Argumenty: brak. Zwraca: brak; zmienia ekran lub rozpoczyna kalibrację.
 void selectSettingsItem() {
   switch (settingsPosition) {
     case 0:
@@ -343,6 +383,9 @@ enum EncoderRotationResult {
   ENCODER_ACTION_LIMIT
 };
 
+// Stosuje obrót enkodera do aktywnego menu, pola lub wartości konfiguracji.
+// Argumenty: kierunek obrotu (+1/-1). Zwraca: ignorowanie, zmianę albo osiągnięcie
+// limitu; może modyfikować kursor, wybór, numberEditValue lub config.
 EncoderRotationResult handleRotation(int8_t direction) {
   if (currentScreen == SCREEN_STATUS ||
       currentScreen == SCREEN_TIME_CALIBRATION) {
@@ -400,6 +443,9 @@ EncoderRotationResult handleRotation(int8_t direction) {
   return ENCODER_ACTION_CHANGED;
 }
 
+// Obsługuje naciśnięcie enkodera zależnie od aktywnego ekranu.
+// Argumenty: brak. Zwraca: czy naciśnięcie zostało obsłużone; może zmieniać ekran,
+// konfigurację, rozpoczynać krok kalibracji lub zlecić reset.
 bool handleButtonPress() {
   if (currentScreen == SCREEN_STATUS) {
     return false;
@@ -461,6 +507,8 @@ bool handleButtonPress() {
   return false;
 }
 
+// Odczytuje kanały enkodera, dekoduje pełny krok i obsługuje jego sygnał dźwiękowy.
+// Argumenty: brak. Zwraca: brak; aktualizuje akumulator przejść i stan UI.
 void pollEncoder() {
   if (currentScreen == SCREEN_STATUS ||
       currentScreen == SCREEN_TIME_CALIBRATION) {
@@ -493,6 +541,8 @@ void pollEncoder() {
   }
 }
 
+// Odczytuje przycisk enkodera z eliminacją drgań i wywołuje jego akcję.
+// Argumenty: brak. Zwraca: brak; aktualizuje stan przycisku i może zmienić UI.
 void pollEncoderButton() {
   const uint32_t now = millis();
   const bool reading = digitalRead(kEncoderButtonPin);
@@ -515,6 +565,8 @@ void pollEncoderButton() {
   }
 }
 
+// Zeruje postęp i liczniki obu pomiarów kalibracji czasu.
+// Argumenty: brak. Zwraca: brak; resetuje wewnętrzny stan kalibracji UI.
 void resetTimeCalibrationState() {
   timeCalibrationStep = 0;
   fillCalibrationElapsedMs = 0;
@@ -526,11 +578,16 @@ void resetTimeCalibrationState() {
   displayedCalibrationTenths = UINT16_MAX;
 }
 
+// Zaokrągla czas w ms do dziesiątych części sekundy i ogranicza go do 99,9 s.
+// Argumenty: zmierzony czas w ms. Zwraca: czas w dziesiątych sekundy.
 uint16_t measuredTimeTenths(uint32_t milliseconds) {
   const uint32_t tenths = (milliseconds + 50) / 100;
   return static_cast<uint16_t>(tenths > 999 ? 999 : tenths);
 }
 
+// Dopisuje zakończone przytrzymanie przycisku do czasu kalibracji i wyłącza wyjścia.
+// Argumenty: bieżący czas w ms i wybór pomiaru napełniania/opróżniania.
+// Zwraca: brak; aktualizuje właściwy licznik i stan przycisku kalibracyjnego.
 void accumulateCalibrationHold(uint32_t now, bool filling) {
   bool &buttonActive =
       filling ? fillCalibrationButtonActive : emptyCalibrationButtonActive;
@@ -546,6 +603,9 @@ void accumulateCalibrationHold(uint32_t now, bool filling) {
   procedureSetManualOutputs(false, false);
 }
 
+// Oblicza wyświetlaną wartość kalibracji, uwzględniając trwające przytrzymanie.
+// Argumenty: bieżący czas w ms. Zwraca: czas w dziesiątych sekundy; nie zapisuje
+// wyniku do konfiguracji.
 uint16_t currentCalibrationDisplayTenths(uint32_t now) {
   const bool filling = timeCalibrationStep == 2;
   const uint32_t elapsed =
@@ -561,6 +621,8 @@ uint16_t currentCalibrationDisplayTenths(uint32_t now) {
   return measuredTimeTenths(boundedTotal);
 }
 
+// Obsługuje ręczne przyciski Z1/Z2 na ekranie głównym i blokadę po zmianie ekranu.
+// Argumenty: brak. Zwraca: brak; może zmieniać wyjścia procedury i tryb ręczny.
 void updateHomeManualControls() {
   const bool fillPressed = digitalRead(kFillButtonPin) == LOW;
   const bool emptyPressed = digitalRead(kEmptyButtonPin) == LOW;
@@ -598,6 +660,8 @@ const Config defaultConfig = {1, 50, 100, 300, 30, 500, 0, false};
 Config config = defaultConfig;
 int currentScreen = SCREEN_HOME;
 
+// Inicjalizuje I2C, wejścia użytkownika, stan debounce oraz wyświetlacz OLED.
+// Argumenty: brak. Zwraca: brak; konfiguruje sprzęt i ustawia flagi UI.
 void uiBegin() {
   Wire.setSDA(kSdaPin);
   Wire.setSCL(kSclPin);
@@ -626,6 +690,8 @@ void uiBegin() {
   markScreenDirty();
 }
 
+// Wykonuje pojedynczy przebieg obsługi przycisków, enkodera i wejść ręcznych.
+// Argumenty: brak. Zwraca: brak; może wywoływać sterowanie procedurą i zmieniać UI.
 void processInput() {
   const uint32_t now = millis();
   const bool stopPressed = pollDebouncedButton(stopButton, now);
@@ -648,6 +714,9 @@ void processInput() {
   updateHomeManualControls();
 }
 
+// Przełącza UI na ekran statusu i inicjuje jego dane.
+// Argumenty: faza, numer bieżącego cyklu, liczba cykli, czas upływu i maksimum (s).
+// Zwraca: brak; zmienia ekran i dane statusu.
 void showStatusScreen(StatusPhase phase, uint8_t currentCycle,
                       uint8_t allCycles, uint32_t elapsedSeconds,
                       uint32_t maximumSeconds) {
@@ -658,6 +727,9 @@ void showStatusScreen(StatusPhase phase, uint8_t currentCycle,
   screenDirty = true;
 }
 
+// Aktualizuje dane statusu i oznacza ekran do rysowania, jeśli coś się zmieniło.
+// Argumenty: faza, numer bieżącego cyklu, liczba cykli, czas upływu i maksimum (s).
+// Zwraca: brak; modyfikuje stan statusu i ewentualnie screenDirty.
 void updateStatusScreen(StatusPhase phase, uint8_t currentCycle,
                         uint8_t allCycles, uint32_t elapsedSeconds,
                         uint32_t maximumSeconds) {
@@ -674,6 +746,8 @@ void updateStatusScreen(StatusPhase phase, uint8_t currentCycle,
   }
 }
 
+// Wraca do ekranu głównego, zeruje wybór i kończy aktywny tryb kalibracji czasu.
+// Argumenty: brak. Zwraca: brak; zmienia ekran, kursor i flagę odświeżenia.
 void returnHomeScreen() {
   if (currentScreen == SCREEN_TIME_CALIBRATION) {
     procedureSetManualOutputs(false, false);
@@ -685,6 +759,8 @@ void returnHomeScreen() {
   screenDirty = true;
 }
 
+// Rozpoczyna kalibrację czasów od kroku pomiaru napełniania.
+// Argumenty: brak. Zwraca: brak; zeruje pomiary, wyłącza wyjścia i zmienia ekran.
 void timeCalibrationStart() {
   procedureSetManualOutputs(false, false);
   resetTimeCalibrationState();
@@ -693,6 +769,8 @@ void timeCalibrationStart() {
   markScreenDirty();
 }
 
+// Kończy kalibrację, wyłącza wyjścia i wraca do ekranu głównego.
+// Argumenty: brak. Zwraca: brak; resetuje stan kalibracji i blokuje ręczne wyjścia.
 void timeCalibrationStop() {
   procedureSetManualOutputs(false, false);
   resetTimeCalibrationState();
@@ -703,6 +781,9 @@ void timeCalibrationStop() {
   markScreenDirty();
 }
 
+// Zatwierdza bieżący pomiar albo przechodzi do następnego kroku kalibracji.
+// Argumenty: brak. Zwraca: true, gdy krok został przyjęty; false dla pustego lub
+// nieaktywnego pomiaru. Aktualizuje config, stan kalibracji i żądanie zapisu.
 bool timeCalibrationNextStep() {
   const uint32_t now = millis();
   if (timeCalibrationStep == 1) {
@@ -755,6 +836,8 @@ bool timeCalibrationNextStep() {
   return false;
 }
 
+// Odczytuje przyciski kalibracji, steruje wyjściem i odświeża licznik pomiaru.
+// Argumenty: brak. Zwraca: brak; aktualizuje czas, wyjścia i flagę rysowania.
 void timeCalibrationUpdate() {
   const uint32_t now = millis();
   if (timeCalibrationStep == 2) {
@@ -786,6 +869,8 @@ void timeCalibrationUpdate() {
   }
 }
 
+// Rysuje aktualny ekran tylko wtedy, gdy jest gotowy, zmieniony i minął limit odświeżania.
+// Argumenty: brak. Zwraca: brak; aktualizuje bufor OLED i stan synchronizacji ekranu.
 void updateScreen() {
   if (!displayReady || !screenDirty) {
     return;

@@ -49,22 +49,31 @@ typedef struct {
     uint32_t display_height;
 } chip_state_t;
 
+// Ogranicza liczbę całkowitą do podanego przedziału.
+// Argumenty: wartość i granice min/max. Zwraca: wartość ograniczoną; niczego nie modyfikuje.
 static int clamp_int(int value, int min, int max) {
     if (value < min) return min;
     if (value > max) return max;
     return value;
 }
 
+// Pobiera starszy bajt z 16-bitowej wartości.
+// Argumenty: wartość źródłowa. Zwraca: bity 15–8; nie modyfikuje stanu układu.
 static uint8_t high_byte(uint16_t value) {
     return (uint8_t)((value >> 8) & 0xff);
 }
 
+// Pobiera młodszy bajt z 16-bitowej wartości.
+// Argumenty: wartość źródłowa. Zwraca: bity 7–0; nie modyfikuje stanu układu.
 static uint8_t low_byte(uint16_t value) {
     return (uint8_t)(value & 0xff);
 }
 
 static void simulation_timer_callback(void *user_data);
 
+// Zapisuje pięć kolumn bitmapy znaku obsługiwanego przez ekran modelu Wokwi.
+// Argumenty: znak i bufor pięciu bajtów glyph. Zwraca: brak; wypełnia glyph,
+// a dla nieobsługiwanych znaków zapisuje pusty wzór.
 static void get_glyph(
     char c,
     uint8_t glyph[5]
@@ -224,6 +233,8 @@ static void get_glyph(
  * DISPLAY
  * ============================================================ */
 
+// Ustawia piksel, jeśli współrzędne mieszczą się w podanym framebufferze.
+// Argumenty: bufor, wymiary, współrzędne i kolor. Zwraca: brak; może zmienić jeden piksel.
 static void set_pixel(
     uint32_t *pixels,
     uint32_t width,
@@ -252,6 +263,8 @@ static void set_pixel(
 }
 
 
+// Czyści cały framebuffer przez ustawienie pikseli na kolor tła.
+// Argumenty: bufor pikseli oraz jego szerokość i wysokość. Zwraca: brak; modyfikuje bufor.
 static void clear_display(
     uint32_t *pixels,
     uint32_t width,
@@ -269,6 +282,9 @@ static void clear_display(
 }
 
 
+// Rysuje znak z bitmapy 5×5 w podanej skali.
+// Argumenty: framebuffer, wymiary, pozycja, znak, skala i kolor.
+// Zwraca: brak; modyfikuje piksele w obszarze znaku.
 static void draw_char(
     uint32_t *pixels,
     uint32_t width,
@@ -328,6 +344,9 @@ static void draw_char(
 }
 
 
+// Rysuje łańcuch znaków, przesuwając kursor o szerokość znaku i odstęp.
+// Argumenty: framebuffer, wymiary, pozycja, tekst, skala i kolor.
+// Zwraca: brak; modyfikuje piksele dla wszystkich obsługiwanych znaków.
 static void draw_text(
     uint32_t *pixels,
     uint32_t width,
@@ -363,6 +382,8 @@ static void draw_text(
  * Update chip display
  * ------------------------------------------------------------ */
 
+// Tworzy ekran modelu INA219 z odczytem prądu i paskiem poziomu.
+// Argumenty: stan modelu układu. Zwraca: brak; zapisuje framebuffer Wokwi.
 static void update_display(
     chip_state_t *chip
 ) {
@@ -590,6 +611,9 @@ static void update_display(
 }
 
 
+// Modeluje narastanie prądu pompy i losowy szum pomiarowy.
+// Argumenty: stan układu, czas pracy w ms i informacja o stanie Z2.
+// Zwraca: symulowany prąd w mA; aktualizuje generator pseudolosowy w stanie układu.
 static float calculate_pump_current(
     chip_state_t *chip,
     uint64_t elapsed_ms,
@@ -613,6 +637,9 @@ static float calculate_pump_current(
 }
 
 
+// Okresowo odczytuje wejścia pompy/Z2, aktualizuje prąd i odświeża ekran modelu.
+// Argumenty: user_data wskazujące na chip_state_t. Zwraca: brak; zmienia stan układu
+// i może wysłać nową zawartość framebufferu do Wokwi.
 static void simulation_timer_callback(void *user_data) {
     chip_state_t *chip = (chip_state_t *)user_data;
     const uint64_t now_ms = get_sim_nanos() / 1000000ULL;
@@ -643,6 +670,9 @@ static void simulation_timer_callback(void *user_data) {
  * EXACT CURRENT INPUT
  * ============================================================ */
 
+// Odczytuje zmienioną tekstową wartość prądu z atrybutu symulatora.
+// Argumenty: stan układu i wskaźnik na wynik. Zwraca: true, gdy pojawiła się
+// nowa poprawna liczba; zapisuje zmieniony tekst w cache i wynik do *value w mA.
 static bool read_exact_current(
     chip_state_t *chip,
     float *value
@@ -767,6 +797,8 @@ static bool read_exact_current(
  * CONTROL UPDATE
  * ============================================================ */
 
+// Odczytuje suwak prądu symulatora i aktualizuje ekran po zmianie wartości.
+// Argumenty: stan układu. Zwraca: brak; może zmienić previous_current, current_mA i framebuffer.
 static void update_controls(
     chip_state_t *chip
 ) {
@@ -819,6 +851,9 @@ static void update_controls(
 }
 
 
+// Callback timera okresowo odświeżającego kontrolki modelu.
+// Argumenty: user_data wskazujące na chip_state_t. Zwraca: brak; deleguje do
+// update_controls, które może zaktualizować prąd i ekran.
 static void controls_timer_callback(
     void *user_data
 ) {
@@ -833,6 +868,8 @@ static void controls_timer_callback(
  * INA219 REGISTER CALCULATIONS
  * ============================================================ */
 
+// Oblicza surowy signed rejestr napięcia bocznika zgodnie z prądem i rezystancją.
+// Argumenty: stan układu. Zwraca: 16-bitową reprezentację rejestru; nie zmienia stanu.
 static uint16_t get_shunt_voltage_register(
     chip_state_t *chip
 ) {
@@ -877,6 +914,8 @@ static uint16_t get_shunt_voltage_register(
 }
 
 
+// Koduje stałe napięcie magistrali jako wartość rejestru INA219.
+// Argumenty: stan układu (nieużywany). Zwraca: 16-bitowy rejestr z flagą konwersji.
 static uint16_t get_bus_voltage_register(
     chip_state_t *chip
 ) {
@@ -913,6 +952,8 @@ static uint16_t get_bus_voltage_register(
 }
 
 
+// Przelicza bieżący prąd na jednostki rejestru INA219 według kalibracji.
+// Argumenty: stan układu. Zwraca: signed wynik zakodowany w uint16_t; nie zmienia stanu.
 static uint16_t get_current_register(
     chip_state_t *chip
 ) {
@@ -994,6 +1035,8 @@ static uint16_t get_current_register(
 }
 
 
+// Oblicza moc i koduje ją w rejestrze INA219 o kroku 2 mW.
+// Argumenty: stan układu. Zwraca: wartość rejestru ograniczoną do zakresu uint16_t.
 static uint16_t get_power_register(
     chip_state_t *chip
 ) {
@@ -1037,6 +1080,9 @@ static uint16_t get_power_register(
  * REGISTER READ
  * ============================================================ */
 
+// Zwraca wartość wskazanego rejestru modelu, delegując obliczenia rejestrów pomiarowych.
+// Argumenty: stan układu i adres rejestru. Zwraca: zawartość rejestru lub zero
+// dla niezmapowanego adresu; nie zmienia stanu układu.
 static uint16_t read_register(
     chip_state_t *chip,
     uint8_t reg
@@ -1093,6 +1139,9 @@ static uint16_t read_register(
  * I2C CONNECT
  * ============================================================ */
 
+// Obsługuje rozpoczęcie transakcji I2C i rozpoznaje adres urządzenia INA219.
+// Argumenty: dane użytkownika, adres i kierunek połączenia. Zwraca: true dla
+// zakończenia/zaakceptowanego adresu; resetuje stan transakcji przy połączeniu.
 static bool i2c_connect(
     void *user_data,
     uint32_t address,
@@ -1140,6 +1189,9 @@ static bool i2c_connect(
  * I2C WRITE
  * ============================================================ */
 
+// Przyjmuje bajty I2C jako wskaźnik rejestru, a następnie dane high/low.
+// Argumenty: dane użytkownika i bajt wejściowy. Zwraca: potwierdzenie bajtu;
+// aktualizuje wskaźnik, stan zapisu lub zapisywalny rejestr.
 static bool i2c_write(
     void *user_data,
     uint8_t data
@@ -1254,6 +1306,9 @@ static bool i2c_write(
  * I2C READ
  * ============================================================ */
 
+// Zwraca kolejny bajt rejestru I2C, wysyłając najpierw MSB, potem LSB.
+// Argumenty: dane użytkownika. Zwraca: odczytany bajt; aktualizuje fazę odczytu
+// i po bajcie młodszym zwiększa wskaźnik rejestru.
 static uint8_t i2c_read(
     void *user_data
 ) {
@@ -1313,6 +1368,8 @@ static uint8_t i2c_read(
  * I2C DISCONNECT
  * ============================================================ */
 
+// Kończy transakcję I2C; callback nie wymaga dodatkowego sprzątania.
+// Argumenty: dane użytkownika. Zwraca: brak; nie zmienia stanu układu.
 static void i2c_disconnect(
     void *user_data
 ) {
@@ -1329,6 +1386,9 @@ static void i2c_disconnect(
  * CHIP INITIALIZATION
  * ============================================================ */
 
+// Przydziela i inicjalizuje stan modelu INA219, jego I2C, wejścia, ekran i timer.
+// Argumenty: brak. Zwraca: brak; rejestruje peryferia i callbacki Wokwi.
+// Przy nieudanej alokacji pozostawia model niezainicjalizowany.
 void chip_init(void) {
 
     /*

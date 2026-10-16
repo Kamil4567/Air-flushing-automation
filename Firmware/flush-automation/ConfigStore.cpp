@@ -53,6 +53,8 @@ bool storageReady = false;
 bool savePending = false;
 uint32_t saveNotBefore = 0;
 
+// Oblicza CRC-32 dla wskazanego zakresu bajtów.
+// Argumenty: bufor danych i jego długość. Zwraca: obliczoną sumę kontrolną.
 uint32_t calculateCrc32(const uint8_t *data, size_t length) {
   uint32_t crc = 0xFFFFFFFFu;
   for (size_t index = 0; index < length; ++index) {
@@ -64,6 +66,8 @@ uint32_t calculateCrc32(const uint8_t *data, size_t length) {
   return ~crc;
 }
 
+// Sprawdza zakresy wartości rekordu aktualnej wersji konfiguracji.
+// Argumenty: rekord do walidacji. Zwraca: true, jeśli wszystkie pola są w zakresie.
 bool configValuesValid(const ConfigRecord &record) {
   return record.cycles >= 1 && record.cycles <= 99 &&
          record.fillTime >= 1 && record.fillTime <= 999 &&
@@ -77,6 +81,8 @@ bool configValuesValid(const ConfigRecord &record) {
          record.pumpCurrentBaselineTenthsMa <= 30000;
 }
 
+// Sprawdza zakresy wartości rekordu konfiguracji w formacie legacy v1.
+// Argumenty: rekord legacy. Zwraca: true, jeśli jego pola są w zakresie.
 bool legacyConfigValuesValid(const LegacyConfigRecord &record) {
   return record.cycles >= 1 && record.cycles <= 99 &&
          record.fillTime >= 1 && record.fillTime <= 999 &&
@@ -89,6 +95,8 @@ bool legacyConfigValuesValid(const LegacyConfigRecord &record) {
          record.pumpCurrentBaselineTenthsMa <= 30000;
 }
 
+// Weryfikuje CRC rekordu obliczone dla bajtów poprzedzających pole crc.
+// Argumenty: rekord dowolnego obsługiwanego formatu. Zwraca: zgodność CRC.
 template <typename Record>
 bool recordCrcValid(const Record &record) {
   const uint32_t expectedCrc = calculateCrc32(
@@ -97,6 +105,8 @@ bool recordCrcValid(const Record &record) {
   return record.crc == expectedCrc;
 }
 
+// Weryfikuje nagłówek, rozmiar, CRC i wartości rekordu bieżącej wersji.
+// Argumenty: rekord bieżącego formatu. Zwraca: true, gdy rekord jest poprawny.
 bool recordValid(const ConfigRecord &record) {
   return record.magic == kRecordMagic &&
          record.version == kRecordVersion &&
@@ -105,6 +115,8 @@ bool recordValid(const ConfigRecord &record) {
          configValuesValid(record);
 }
 
+// Weryfikuje nagłówek, rozmiar, CRC i wartości rekordu w formacie legacy.
+// Argumenty: rekord v1. Zwraca: true, gdy rekord można bezpiecznie migrować.
 bool legacyRecordValid(const LegacyConfigRecord &record) {
   return record.magic == kRecordMagic &&
          record.version == kLegacyRecordVersion &&
@@ -113,6 +125,8 @@ bool legacyRecordValid(const LegacyConfigRecord &record) {
          legacyConfigValuesValid(record);
 }
 
+// Kopiuje pola rekordu bieżącej wersji do przekazanej konfiguracji.
+// Argumenty: źródłowy rekord i wskaźnik do celu. Zwraca: brak; nadpisuje pola celu.
 void recordToConfig(const ConfigRecord &record, Config *config) {
   config->cycles = record.cycles;
   config->fill_time = record.fillTime;
@@ -126,6 +140,8 @@ void recordToConfig(const ConfigRecord &record, Config *config) {
       record.pumpCurrentBaselineValid != 0;
 }
 
+// Migruje ustawienia v1 do config, uzupełniając brakujące pola wartościami domyślnymi.
+// Argumenty: zwalidowany rekord legacy. Zwraca: brak; nadpisuje globalne config.
 void migrateLegacyRecord(const LegacyConfigRecord &record) {
   config = defaultConfig;
   config.cycles = record.cycles;
@@ -142,6 +158,8 @@ void migrateLegacyRecord(const LegacyConfigRecord &record) {
       record.pumpCurrentBaselineValid != 0;
 }
 
+// Buduje aktualny rekord EEPROM z globalnej konfiguracji i oblicza jego CRC.
+// Argumenty: brak. Zwraca: gotowy rekord; nie zapisuje go samodzielnie do EEPROM.
 ConfigRecord configToRecord() {
   ConfigRecord record = {};
   record.magic = kRecordMagic;
@@ -165,6 +183,8 @@ ConfigRecord configToRecord() {
 
 }  // namespace
 
+// Uruchamia emulację EEPROM, odczytuje i waliduje rekord, migruje v1 lub ładuje defaults.
+// Argumenty: brak. Zwraca: brak; ustawia config i może zgłosić potrzebę zapisu.
 void configStoreBegin() {
   EEPROM.begin(kEepromBufferSize);
   storageReady = true;
@@ -185,6 +205,8 @@ void configStoreBegin() {
   }
 }
 
+// Zgłasza potrzebę zapisu konfiguracji po okresie bez kolejnych zmian.
+// Argumenty: brak. Zwraca: brak; ustawia savePending i termin 750 ms, jeśli storage działa.
 void configStoreRequestSave() {
   if (!storageReady) {
     return;
@@ -193,6 +215,8 @@ void configStoreRequestSave() {
   saveNotBefore = millis() + kSaveDebounceMs;
 }
 
+// Zapisuje oczekującą konfigurację po upływie debounce i zatwierdza ją w EEPROM.
+// Argumenty: brak. Zwraca: brak; może wyczyścić savePending po udanym commit.
 void configStoreService() {
   if (!storageReady || !savePending ||
       static_cast<int32_t>(millis() - saveNotBefore) < 0) {
