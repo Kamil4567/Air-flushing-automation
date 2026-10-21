@@ -96,7 +96,8 @@ Automat w `Procedure.cpp` realizuje następujący przebieg dla każdego cyklu:
 6. Wyłącza wyjścia i odczekuje `actuation_time`.
 7. Rozpoczyna następny cykl lub kończy procedurę.
 
-Podczas zakończenia normalnego odtwarzany jest długi sygnał dźwiękowy. STOP
+Podczas zakończenia normalnego odtwarzana jest seria trzech sygnałów 3 kHz
+(każdy 333 ms, przerwy 100 ms). STOP
 natychmiast ustawia wyjścia w stan niski, przerywa automat i odtwarza serię
 krótkich sygnałów.
 

@@ -16,7 +16,6 @@ constexpr bool kEnablePumpCutoffDetection = true;
 constexpr uint32_t kCurrentSampleIntervalMs = 100;
 constexpr uint8_t kCutoffConfirmSamples = 3;
 constexpr uint16_t kShortBeepMs = 100;
-constexpr uint16_t kLongBeepMs = 800;
 constexpr uint16_t kFastBeepMs = 80;
 constexpr uint16_t kFastBeepGapMs = 80;
 constexpr uint8_t kMaxBeepSteps = 8;
@@ -46,6 +45,12 @@ struct BeepStep {
   uint16_t frequency;
   uint16_t durationMs;
   uint16_t gapMs;
+};
+
+constexpr BeepStep kEndSequence[] = {
+  {2000, 333, 100},
+  {2000, 333, 100},
+  {2000, 500, 0},
 };
 
 struct Beeper {
@@ -270,7 +275,9 @@ void finishProcedure(uint32_t now) {
   setMachineState(MACHINE_IDLE, now);
   procedureActive = false;
   stage = STAGE_IDLE;
-  startBeepPattern(1, kLongBeepMs, 0, now);
+  startBeepSequence(kEndSequence,
+                    static_cast<uint8_t>(sizeof(kEndSequence) / sizeof(kEndSequence[0])),
+                    now);
   returnHomeScreen();
 }
 
