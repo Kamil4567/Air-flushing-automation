@@ -86,13 +86,15 @@ limit, limit jest automatycznie podnoszony do wymaganej pełnej sekundy.
 
 ## Automat procedury
 
-Automat w `Procedure.cpp` realizuje następujący przebieg dla każdego cyklu:
+Automat w `Procedure.cpp` zaczyna od jednorazowego opróżniania (kroki 4-6
+poniżej), a następnie wykonuje `cycles` razy następujący przebieg:
 
 1. Włącza Z1 (napełnianie) na czas `actuation_time`.
 2. Utrzymuje napełnianie przez `fill_time`.
 3. Wyłącza wyjścia i odczekuje `actuation_time`.
 4. Włącza Z2 i pompę na czas `actuation_time`.
-5. Monitoruje prąd pompy do wykrycia odcięcia albo do upływu `empty_time`.
+5. Monitoruje prąd pompy; wykrycie odcięcia kończy krok, a `empty_time` jest
+   maksymalnym czasem opróżniania.
 6. Wyłącza wyjścia i odczekuje `actuation_time`.
 7. Rozpoczyna następny cykl lub kończy procedurę.
 
@@ -117,18 +119,28 @@ Wyjścia są ustawiane centralnie przez zmianę stanu maszyny:
 krok rejestru odpowiada `0,1 mA`. Odczyt rejestru przez `Wire` zapewnia szkic
 Arduino.
 
-Wykrywanie odcięcia jest włączone. Podczas opróżniania pomiar wykonywany jest
-co 100 ms; prąd wyższy od zapisanej bazy przez trzy kolejne próbki kończy
-monitorowanie tego cyklu. Nieudany odczyt zeruje licznik kolejnych próbek.
-Niezależnie od detekcji prądu opróżnianie kończy się po upływie
-`empty_time × 100 ms`.
+Wykrywanie odcięcia jest włączone. Podczas opróżniania (po 1 s rozruchu pompy)
+prąd jest próbkowany co 100 ms i wygładzany średnią z 3 próbek (300 ms).
+Odcięcie (zamknięcie zaworu) jest zgłaszane, gdy przez 3 kolejne próbki
+spełniony jest jeden z warunków: średni prąd osiągnął połowę drogi między
+prądem przy otwartym i zamkniętym zaworze, albo narost prądu w 300 ms
+(średnia bieżąca minus poprzednia) przekracza połowę największego narostu
+zmierzonego w kalibracji (min. 10% różnicy prądów), a prąd jest już ponad
+25% tej drogi. Wykrycie odcięcia natychmiast kończy krok opróżniania i
+procedura przechodzi dalej. `empty_time` jest tylko maksymalnym czasem
+opróżniania: kończy krok awaryjnie, gdy odcięcie nie zostanie wykryte.
+Nieudany odczyt zeruje okno próbek i licznik.
 
-W kodzie istnieje sekwencja kalibracji bazy prądu (`startCalibration()` i
-powiązane etapy), która uśrednia próbki przez 10 sekund. **W aktualnym kodzie
-`startCalibration()` nie jest nigdzie wywoływana**, a start procedury przechodzi
-bezpośrednio do napełniania. W efekcie firmware korzysta z bazy prądu tylko,
-jeśli została już zapisana w EEPROM; bez poprawnej bazy wykrywanie odcięcia
-prądem nie zadziała i cykl zakończy się limitem `empty_time`.
+Zwykły start procedury nie wykonuje kalibracji; korzysta z danych zapisanych
+w EEPROM (prąd przy otwartym zaworze, przy zamkniętym zaworze i największy
+narost). Bez poprawnej kalibracji wykrywanie nie działa i cykl kończy się
+limitem `empty_time`.
+
+Kalibrację prądu wykonuje się w trybie testowym (włączenie z wciśniętym
+przyciskiem STOP, strona 3): 5 przebiegów, każdy to rozruch pompy z otwartym
+zaworem Z2, pomiar prądu swobodnego przepływu, a następnie zamknięcie zaworu
+Z2 przy pracującej pompie i pomiar prądu oraz narostu. Wynik jest średnią z
+poprawnych przebiegów (wymagana ich większość) i jest zapisywany w EEPROM.
 
 ## Konfiguracja
 

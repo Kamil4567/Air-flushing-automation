@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <hardware/watchdog.h>
+#include <math.h>
+#include <string.h>
 
 #include "Ina219.h"
 #include "ConfigStore.h"
@@ -14,6 +16,27 @@ constexpr uint8_t kZ2Pin = 9;
 constexpr uint8_t kPumpPin = 10;
 constexpr bool kEnablePumpCutoffDetection = true;
 constexpr uint32_t kCurrentSampleIntervalMs = 100;
+// Kalibracja: rozruch pompy, pomiar przy otwartym zaworze, potem przy zamkniętym.
+constexpr uint32_t kCalibrationSpinupMs = 2000;
+constexpr uint32_t kCalibrationOpenMs = 5000;
+constexpr uint32_t kCalibrationClosedMs = 6000;
+constexpr uint32_t kCalibrationClosedTailMs = 2000;
+constexpr uint32_t kCalibrationRunPauseMs = 2000;
+constexpr uint8_t kCalibrationTestRuns = 5;
+constexpr uint32_t kCalibrationTotalMs =
+    kCalibrationSpinupMs + kCalibrationOpenMs + kCalibrationClosedMs;
+constexpr float kMinCalibrationRiseMa = 5.0f;
+// Wymagany wzrost prądu to wielokrotność odchylenia standardowego prądu przy otwartym zaworze.
+constexpr float kMinRiseToNoiseRatio = 3.0f;
+// Prąd rozruchowy pompy jest pomijany w detekcji odcięcia.
+constexpr uint32_t kMonitorIgnoreMs = 1000;
+// Okno wygładzania i porównania: 3 próbki (300 ms) bieżące kontra 3 poprzednie.
+constexpr uint8_t kWindowSamples = 3;
+constexpr uint8_t kRingSize = 2 * kWindowSamples;
+constexpr float kCutoffLevelFraction = 0.5f;
+constexpr float kCutoffEarlyFraction = 0.25f;
+constexpr float kCutoffSlopeFraction = 0.5f;
+constexpr float kCutoffMinSlopeFraction = 0.1f;
 constexpr uint8_t kCutoffConfirmSamples = 3;
 constexpr uint16_t kShortBeepMs = 100;
 constexpr uint16_t kFastBeepMs = 80;
@@ -32,6 +55,8 @@ enum ProcedureStage : uint8_t {
   STAGE_START_PENDING,
   STAGE_CALIBRATION_ACTUATION,
   STAGE_CALIBRATION_SAMPLE,
+  STAGE_CALIBRATION_CLOSED,
+  STAGE_CALIBRATION_PAUSE,
   STAGE_CALIBRATION_SETTLE,
   STAGE_FILL_ACTUATION,
   STAGE_FILL_DURATION,
@@ -68,9 +93,32 @@ ProcedureStage stage = STAGE_IDLE;
 Beeper beeper = {};
 bool procedureActive = false;
 bool baselineValid = false;
+// Prąd przy otwartym zaworze (swobodny przepływ).
 float calibrationBaselineMa = 0.0f;
+// Prąd przy zamkniętym zaworze oraz największy narost w oknie 300 ms.
+float calibrationBlockedMa = 0.0f;
+float calibrationMaxDeltaMa = 0.0f;
 double calibrationCurrentSumMa = 0.0;
 uint32_t calibrationSampleCount = 0;
+double calibrationTailSumMa = 0.0;
+uint32_t calibrationTailCount = 0;
+float calibrationOpenNoiseMa = 0.0f;
+double calibrationSumSqMa = 0.0;
+float lastCalOpenMa = 0.0f;
+float lastCalBlockedMa = 0.0f;
+float lastCalRequiredMa = 0.0f;
+bool lastCalibrationOk = false;
+// Kalibracja wieloprzebiegowa: wyniki poprawnych przebiegów są uśredniane.
+uint8_t calibrationRunsTarget = 1;
+uint8_t calibrationRunIndex = 0;
+uint8_t calibrationValidRuns = 0;
+double runSumOpenMa = 0.0;
+double runSumBlockedMa = 0.0;
+double runSumDeltaMa = 0.0;
+float currentRing[kRingSize] = {};
+uint8_t ringHead = 0;
+uint8_t ringCount = 0;
+float lastDeltaMa = 0.0f;
 uint32_t procedureStartedAt = 0;
 uint32_t maximumProcedureMs = 0;
 uint32_t stageDeadline = 0;
@@ -80,6 +128,19 @@ uint32_t lastDisplayedSecond = UINT32_MAX;
 uint8_t currentCycle = 0;
 uint8_t consecutiveAboveBaseline = 0;
 StatusPhase displayedPhase = STATUS_EMPTY;
+bool hasCurrentSample = false;
+bool lastSensorOk = false;
+float lastCurrentMa = 0.0f;
+float calibrationMinMa = 0.0f;
+float calibrationMaxMa = 0.0f;
+bool testCalibrationActive = false;
+TestCalibrationPhase testCalibrationResult = TEST_CAL_IDLE;
+
+constexpr BeepStep kTestFailSequence[] = {
+  {800, 35, 45},
+  {800, 35, 45},
+  {800, 35, 0},
+};
 
 // Sprawdza osiągnięcie terminu z uwzględnieniem przepełnienia licznika millis().
 // Argumenty: bieżący czas i termin w ms. Zwraca: true, gdy termin minął.
@@ -116,8 +177,8 @@ void publishStatus(uint32_t now, bool force = false) {
   const uint32_t elapsed = procedureElapsedSeconds(now);
   if (force || elapsed != lastDisplayedSecond) {
     lastDisplayedSecond = elapsed;
-    updateStatusScreen(displayedPhase, currentCycle, config.cycles, elapsed,
-                       statusMaximumSeconds());
+    updateStatusScreen(displayedPhase, currentCycle > 0 ? currentCycle : 1,
+                       config.cycles, elapsed, statusMaximumSeconds());
   }
 }
 
@@ -223,7 +284,7 @@ void updateBeeper(uint32_t now) {
   }
 }
 
-// Szacuje maksymalny czas wszystkich cykli na podstawie bieżącej konfiguracji.
+// Szacuje maksymalny czas procedury (opróżnianie początkowe + wszystkie cykle).
 // Argumenty: brak. Zwraca: czas w ms ograniczony do zakresu uint32_t.
 uint32_t calculateMaximumProcedureMs() {
   const uint64_t actuation = config.actuation_time;
@@ -231,8 +292,9 @@ uint32_t calculateMaximumProcedureMs() {
       static_cast<uint64_t>(config.empty_time) * 100;
   const uint64_t fillDuration =
       static_cast<uint64_t>(config.fill_time) * 100;
-  const uint64_t total = static_cast<uint64_t>(config.cycles) *
-                         (4 * actuation + fillDuration + emptyDuration);
+  const uint64_t initialEmpty = 2 * actuation + emptyDuration;
+  const uint64_t total = initialEmpty + static_cast<uint64_t>(config.cycles) *
+                             (4 * actuation + fillDuration + emptyDuration);
 
   if (total > UINT32_MAX) {
     return UINT32_MAX;
@@ -252,12 +314,16 @@ void beginCycleFill(uint32_t now) {
   stageDeadline = now + config.actuation_time;
 }
 
+// Zeruje okno ostatnich próbek prądu (definicja poniżej).
+void resetCurrentRing();
+
 // Inicjuje pomiar czasu opróżniania i próbkowanie prądu pompy.
 // Argumenty: bieżący czas w ms. Zwraca: brak; zeruje licznik próbek i zmienia etap.
 void beginPumpMonitor(uint32_t now) {
   emptyStartedAt = now;
   lastCurrentSampleAt = now - kCurrentSampleIntervalMs;
   consecutiveAboveBaseline = 0;
+  resetCurrentRing();
   stage = STAGE_CYCLE_EMPTY_MONITOR;
 }
 
@@ -281,62 +347,279 @@ void finishProcedure(uint32_t now) {
   returnHomeScreen();
 }
 
-// Uśrednia zebrane próbki bazy prądu, zapisuje wynik i planuje dalszy przebieg.
-// Argumenty: bieżący czas w ms. Zwraca: brak; aktualizuje bazę, konfigurację,
-// żądanie zapisu, stan maszyny i etap kalibracji.
-void finishCalibration(uint32_t now) {
-  if (calibrationSampleCount > 0) {
-    calibrationBaselineMa = static_cast<float>(
-        calibrationCurrentSumMa / calibrationSampleCount);
-    baselineValid = true;
-    const float baselineTenthsMa = calibrationBaselineMa * 10.0f + 0.5f;
-    config.pump_current_baseline_tenths_ma =
-        baselineTenthsMa >= 30000.0f
-            ? 30000
-            : static_cast<uint16_t>(baselineTenthsMa);
-    config.pump_current_baseline_valid = true;
-    configStoreRequestSave();
-  } else {
-    baselineValid = false;
+// Zeruje okno ostatnich próbek prądu używane do wygładzania i liczenia narostu.
+// Argumenty: brak. Zwraca: brak; zeruje licznik próbek i ostatni narost.
+void resetCurrentRing() {
+  ringHead = 0;
+  ringCount = 0;
+  lastDeltaMa = 0.0f;
+}
+
+// Średnia z trzech próbek w oknie liczonym od najnowszej (offset 0) lub poprzedniej (offset 3).
+// Argumenty: przesunięcie okna wstecz w próbkach. Zwraca: średni prąd w mA.
+float ringWindowAverage(uint8_t offset) {
+  float sum = 0.0f;
+  for (uint8_t i = 0; i < kWindowSamples; ++i) {
+    const uint8_t index =
+        (ringHead + kRingSize - 1 - offset - i) % kRingSize;
+    sum += currentRing[index];
+  }
+  return sum / kWindowSamples;
+}
+
+// Średni prąd z ostatnich 300 ms. Argumenty: brak. Zwraca: wartość w mA.
+float recentAverageMa() {
+  return ringWindowAverage(0);
+}
+
+// Dodaje próbkę do okna i aktualizuje narost (średnia bieżąca minus poprzednia, 300 ms).
+// Argumenty: prąd w mA. Zwraca: brak; zmienia ringHead, ringCount i lastDeltaMa.
+void pushCurrent(float currentMa) {
+  currentRing[ringHead] = currentMa;
+  ringHead = (ringHead + 1) % kRingSize;
+  if (ringCount < kRingSize) {
+    ++ringCount;
+  }
+  lastDeltaMa = ringCount == kRingSize
+                    ? ringWindowAverage(0) - ringWindowAverage(kWindowSamples)
+                    : 0.0f;
+}
+
+// Odczytuje prąd z INA219 i zapisuje wynik w stanie diagnostycznym i oknie próbek.
+// Argumenty: brak. Zwraca: true, gdy odczyt się udał; po błędzie czyści okno próbek.
+bool sampleCurrent() {
+  float currentMa;
+  lastSensorOk = ina219_read_current_ma(&currentMa);
+  hasCurrentSample = true;
+  if (!lastSensorOk) {
+    resetCurrentRing();
+    return false;
+  }
+  lastCurrentMa = currentMa;
+  pushCurrent(currentMa);
+  return true;
+}
+
+// Zamienia prąd w mA na dziesiąte części mA ograniczone do zakresu zapisu (0-3000 mA).
+// Argumenty: prąd w mA. Zwraca: wartość całkowita do zapisu w konfiguracji.
+uint16_t toStoredTenthsMa(float currentMa) {
+  const float tenths = currentMa * 10.0f + 0.5f;
+  if (tenths <= 0.0f) {
+    return 0;
+  }
+  return tenths >= 30000.0f ? 30000 : static_cast<uint16_t>(tenths);
+}
+
+// Przywraca dane kalibracji prądu zapisane w konfiguracji.
+// Argumenty: brak. Zwraca: brak; kalibracja jest ważna tylko przy zamkniętym zaworze
+// dającym wyższy prąd niż otwarty.
+void restoreCalibrationFromConfig() {
+  calibrationBaselineMa = config.pump_current_baseline_tenths_ma / 10.0f;
+  calibrationBlockedMa = config.pump_current_blocked_tenths_ma / 10.0f;
+  calibrationMaxDeltaMa = config.pump_current_rise_tenths_ma / 10.0f;
+  baselineValid = config.pump_current_baseline_valid &&
+                  calibrationBlockedMa > calibrationBaselineMa &&
+                  calibrationMaxDeltaMa > 0.0f;
+}
+
+// Poziom prądu uznawany za zamknięty zawór (połowa drogi od otwartego do zamkniętego).
+// Argumenty: brak. Zwraca: próg w mA.
+float cutoffLevelMa() {
+  return calibrationBaselineMa +
+         kCutoffLevelFraction * (calibrationBlockedMa - calibrationBaselineMa);
+}
+
+// Minimalny narost prądu w 300 ms uznawany za zamykanie zaworu.
+// Argumenty: brak. Zwraca: limit narostu w mA.
+float cutoffSlopeLimitMa() {
+  const float rise = calibrationBlockedMa - calibrationBaselineMa;
+  const float fromSlope = kCutoffSlopeFraction * calibrationMaxDeltaMa;
+  const float fromRise = kCutoffMinSlopeFraction * rise;
+  return fromSlope > fromRise ? fromSlope : fromRise;
+}
+
+// Sprawdza warunek odcięcia: prąd osiągnął poziom zamkniętego zaworu albo szybko rośnie
+// i jest już wyraźnie ponad prądem otwartego zaworu.
+// Argumenty: brak. Zwraca: true, gdy ostatnia próbka spełnia warunek.
+bool cutoffConditionMet() {
+  if (!baselineValid || ringCount < kRingSize) {
+    return false;
   }
 
+  const float recent = recentAverageMa();
+  const float earlyFloor =
+      calibrationBaselineMa +
+      kCutoffEarlyFraction * (calibrationBlockedMa - calibrationBaselineMa);
+  return recent >= cutoffLevelMa() ||
+         (lastDeltaMa >= cutoffSlopeLimitMa() && recent >= earlyFloor);
+}
+
+// Zeruje statystyki bieżącej fazy kalibracji (suma, licznik, min, max).
+// Argumenty: brak. Zwraca: brak.
+void resetCalibrationPhaseStats() {
+  calibrationCurrentSumMa = 0.0;
+  calibrationSumSqMa = 0.0;
+  calibrationSampleCount = 0;
+  calibrationMinMa = 0.0f;
+  calibrationMaxMa = 0.0f;
+}
+
+// Dodaje próbkę do statystyk bieżącej fazy kalibracji.
+// Argumenty: prąd w mA. Zwraca: brak.
+void addCalibrationPhaseSample(float currentMa) {
+  if (calibrationSampleCount == 0 || currentMa < calibrationMinMa) {
+    calibrationMinMa = currentMa;
+  }
+  if (calibrationSampleCount == 0 || currentMa > calibrationMaxMa) {
+    calibrationMaxMa = currentMa;
+  }
+  calibrationCurrentSumMa += currentMa;
+  calibrationSumSqMa += static_cast<double>(currentMa) * currentMa;
+  ++calibrationSampleCount;
+}
+
+// Zapisuje średnie z poprawnych przebiegów kalibracji, o ile jest ich dość.
+// Argumenty: brak. Zwraca: true, gdy kalibracja została zaakceptowana i zapisana.
+bool commitAveragedCalibration() {
+  const uint8_t requiredRuns = calibrationRunsTarget / 2 + 1;
+  if (calibrationValidRuns < requiredRuns) {
+    return false;
+  }
+
+  calibrationBaselineMa =
+      static_cast<float>(runSumOpenMa / calibrationValidRuns);
+  calibrationBlockedMa =
+      static_cast<float>(runSumBlockedMa / calibrationValidRuns);
+  calibrationMaxDeltaMa =
+      static_cast<float>(runSumDeltaMa / calibrationValidRuns);
+  baselineValid = true;
+  config.pump_current_baseline_tenths_ma =
+      toStoredTenthsMa(calibrationBaselineMa);
+  config.pump_current_blocked_tenths_ma =
+      toStoredTenthsMa(calibrationBlockedMa);
+  config.pump_current_rise_tenths_ma = toStoredTenthsMa(calibrationMaxDeltaMa);
+  config.pump_current_baseline_valid = true;
+  configStoreRequestSave();
+  return true;
+}
+
+// Kończy jeden przebieg kalibracji: ocenia wzrost prądu po zamknięciu zaworu i
+// dolicza go do średnich. Po ostatnim przebiegu zapisuje wynik albo przywraca poprzedni.
+// Argumenty: bieżący czas w ms. Zwraca: brak; zmienia licznik przebiegów, stan maszyny i etap.
+void finishCalibration(uint32_t now) {
+  if (calibrationTailCount > 0) {
+    const float blocked =
+        static_cast<float>(calibrationTailSumMa / calibrationTailCount);
+    const float rise = blocked - calibrationBaselineMa;
+    const float requiredRise =
+        kMinRiseToNoiseRatio * calibrationOpenNoiseMa > kMinCalibrationRiseMa
+            ? kMinRiseToNoiseRatio * calibrationOpenNoiseMa
+            : kMinCalibrationRiseMa;
+    lastCalBlockedMa = blocked;
+    lastCalRequiredMa = requiredRise;
+    if (rise >= requiredRise && calibrationMaxDeltaMa > 0.0f) {
+      runSumOpenMa += calibrationBaselineMa;
+      runSumBlockedMa += blocked;
+      runSumDeltaMa += calibrationMaxDeltaMa;
+      ++calibrationValidRuns;
+    }
+  }
+  ++calibrationRunIndex;
+
   setMachineState(MACHINE_IDLE, now);
+  if (calibrationRunIndex < calibrationRunsTarget) {
+    stage = STAGE_CALIBRATION_PAUSE;
+    stageDeadline = now + kCalibrationRunPauseMs;
+    return;
+  }
+
+  lastCalibrationOk = commitAveragedCalibration();
+  if (!lastCalibrationOk) {
+    restoreCalibrationFromConfig();
+  }
   stage = STAGE_CALIBRATION_SETTLE;
   stageDeadline = now + config.actuation_time;
 }
 
-// Rozpoczyna kalibrację bazy prądu: zeruje akumulację i włącza pompę.
-// Argumenty: bieżący czas w ms. Zwraca: brak; ustawia stan, etap i termin kalibracji.
-void startCalibration(uint32_t now) {
-  calibrationCurrentSumMa = 0.0;
-  calibrationSampleCount = 0;
-  baselineValid = false;
-  lastCurrentSampleAt = now - kCurrentSampleIntervalMs;
+// Kończy pomiar przy otwartym zaworze i zamyka zawór (Z2 wyłączony, pompa pracuje).
+// Argumenty: bieżący czas w ms. Zwraca: brak; zapisuje prąd otwarty i szum, przechodzi
+// do etapu zamkniętego zaworu albo kończy kalibrację błędem przy braku próbek.
+void finishOpenPhase(uint32_t now) {
+  if (calibrationSampleCount == 0) {
+    finishCalibration(now);
+    return;
+  }
+
+  const double mean = calibrationCurrentSumMa / calibrationSampleCount;
+  const double variance =
+      calibrationSumSqMa / calibrationSampleCount - mean * mean;
+  calibrationBaselineMa = static_cast<float>(mean);
+  calibrationOpenNoiseMa =
+      variance > 0.0 ? static_cast<float>(sqrt(variance)) : 0.0f;
+  lastCalOpenMa = calibrationBaselineMa;
+  lastCalBlockedMa = 0.0f;
+  lastCalRequiredMa = 0.0f;
+  calibrationBlockedMa = 0.0f;
+  calibrationMaxDeltaMa = 0.0f;
+  calibrationTailSumMa = 0.0;
+  calibrationTailCount = 0;
+  resetCalibrationPhaseStats();
+
   setMachineState(MACHINE_CALIBRATION, now);
-  stage = STAGE_CALIBRATION_ACTUATION;
-  stageDeadline = now + config.actuation_time;
+  stage = STAGE_CALIBRATION_CLOSED;
+  stageDeadline = now + kCalibrationClosedMs;
+  lastCurrentSampleAt = now - kCurrentSampleIntervalMs;
 }
 
-// Próbkuje prąd co 100 ms i sprawdza przekroczenie zapisanej bazy przez 3 próbki.
-// Argumenty: bieżący czas w ms. Zwraca: true po potwierdzonym przekroczeniu;
-// aktualizuje czas próbki i licznik kolejnych odczytów ponad bazą.
-bool pollPumpCurrent(uint32_t now) {
+// Rozpoczyna pojedynczy przebieg kalibracji: zeruje statystyki, otwiera zawór Z2 i włącza pompę.
+// Argumenty: bieżący czas w ms. Zwraca: brak; ustawia stan, etap i termin rozruchu.
+void startCalibrationRun(uint32_t now) {
+  resetCalibrationPhaseStats();
+  resetCurrentRing();
+  calibrationTailSumMa = 0.0;
+  calibrationTailCount = 0;
+  calibrationOpenNoiseMa = 0.0f;
+  calibrationMaxDeltaMa = 0.0f;
+  baselineValid = false;
+  lastCurrentSampleAt = now - kCurrentSampleIntervalMs;
+  setMachineState(MACHINE_EMPTY, now);
+  stage = STAGE_CALIBRATION_ACTUATION;
+  stageDeadline = now + kCalibrationSpinupMs;
+}
+
+// Rozpoczyna kalibrację składającą się z podanej liczby przebiegów.
+// Argumenty: bieżący czas w ms i liczba przebiegów. Zwraca: brak; zeruje średnie.
+void startCalibration(uint32_t now, uint8_t runs) {
+  calibrationRunsTarget = runs;
+  calibrationRunIndex = 0;
+  calibrationValidRuns = 0;
+  runSumOpenMa = 0.0;
+  runSumBlockedMa = 0.0;
+  runSumDeltaMa = 0.0;
+  lastCalibrationOk = false;
+  startCalibrationRun(now);
+}
+
+// Próbkuje prąd co 100 ms i sprawdza warunek odcięcia przez 3 kolejne próbki.
+// Argumenty: bieżący czas w ms i flaga oceny warunku (false pomija rozruch pompy).
+// Zwraca: true po potwierdzonym odcięciu; aktualizuje licznik kolejnych próbek.
+bool pollPumpCurrent(uint32_t now, bool evaluate = true) {
   if (now - lastCurrentSampleAt < kCurrentSampleIntervalMs) {
     return false;
   }
   lastCurrentSampleAt = now;
 
-  float currentMa;
-  if (!ina219_read_current_ma(&currentMa)) {
+  if (!sampleCurrent()) {
     consecutiveAboveBaseline = 0;
     return false;
   }
 
-  if (!baselineValid) {
+  if (!evaluate) {
+    consecutiveAboveBaseline = 0;
     return false;
   }
 
-  if (currentMa > calibrationBaselineMa) {
+  if (cutoffConditionMet()) {
     if (consecutiveAboveBaseline < kCutoffConfirmSamples) {
       ++consecutiveAboveBaseline;
     }
@@ -347,25 +630,56 @@ bool pollPumpCurrent(uint32_t now) {
   return consecutiveAboveBaseline >= kCutoffConfirmSamples;
 }
 
-// Przeprowadza etapy rozruchu oraz 10-sekundowego próbkowania bazy prądu.
-// Argumenty: bieżący czas w ms. Zwraca: brak; zbiera próbki i może zakończyć kalibrację.
+// Przeprowadza rozruch, pomiar przy otwartym zaworze i pomiar po jego zamknięciu.
+// Argumenty: bieżący czas w ms. Zwraca: brak; zbiera próbki i kończy kalibrację.
 void updateCalibration(uint32_t now) {
+  if (stage == STAGE_CALIBRATION_PAUSE) {
+    if (deadlineReached(now, stageDeadline)) {
+      startCalibrationRun(now);
+    }
+    return;
+  }
+
   if (stage == STAGE_CALIBRATION_ACTUATION) {
     if (!deadlineReached(now, stageDeadline)) {
       return;
     }
+    resetCalibrationPhaseStats();
+    resetCurrentRing();
     stage = STAGE_CALIBRATION_SAMPLE;
-    stageDeadline = now + 10UL * 1000;
+    stageDeadline = now + kCalibrationOpenMs;
     lastCurrentSampleAt = now - kCurrentSampleIntervalMs;
   }
 
+  const bool sampleDue = now - lastCurrentSampleAt >= kCurrentSampleIntervalMs;
+
   if (stage == STAGE_CALIBRATION_SAMPLE) {
-    if (now - lastCurrentSampleAt >= kCurrentSampleIntervalMs) {
+    if (sampleDue) {
       lastCurrentSampleAt = now;
-      float currentMa;
-      if (ina219_read_current_ma(&currentMa)) {
-        calibrationCurrentSumMa += currentMa;
-        ++calibrationSampleCount;
+      if (sampleCurrent()) {
+        addCalibrationPhaseSample(lastCurrentMa);
+      }
+    }
+
+    if (deadlineReached(now, stageDeadline)) {
+      finishOpenPhase(now);
+    }
+    return;
+  }
+
+  if (stage == STAGE_CALIBRATION_CLOSED) {
+    if (sampleDue) {
+      lastCurrentSampleAt = now;
+      if (sampleCurrent()) {
+        addCalibrationPhaseSample(lastCurrentMa);
+        if (ringCount == kRingSize && lastDeltaMa > calibrationMaxDeltaMa) {
+          calibrationMaxDeltaMa = lastDeltaMa;
+        }
+        if (static_cast<int32_t>(stageDeadline - now) <=
+            static_cast<int32_t>(kCalibrationClosedTailMs)) {
+          calibrationTailSumMa += lastCurrentMa;
+          ++calibrationTailCount;
+        }
       }
     }
 
@@ -375,15 +689,26 @@ void updateCalibration(uint32_t now) {
   }
 }
 
-// Kończy nadzór opróżniania po detekcji prądu albo po upływie limitu czasu.
+// Kończy opróżnianie po wykryciu odcięcia (zamknięcia zaworu) i przechodzi dalej.
+// empty_time jest tylko maksymalnym czasem opróżniania, który kończy krok awaryjnie.
 // Argumenty: bieżący czas w ms. Zwraca: brak; przy spełnieniu warunku przełącza etap.
 void updatePumpMonitor(uint32_t now) {
   const bool cutoffDetected =
-      kEnablePumpCutoffDetection && pollPumpCurrent(now);
+      kEnablePumpCutoffDetection &&
+      pollPumpCurrent(now, now - emptyStartedAt >= kMonitorIgnoreMs);
   const bool timedOut =
       now - emptyStartedAt >= config.empty_time * 100UL;
   if (!cutoffDetected && !timedOut) {
     return;
+  }
+
+  // Wcześniejsze odcięcie skraca szacowany całkowity czas o niewykorzystany limit.
+  const uint32_t limitMs = config.empty_time * 100UL;
+  const uint32_t usedMs = now - emptyStartedAt;
+  if (usedMs < limitMs) {
+    const uint32_t savedMs = limitMs - usedMs;
+    maximumProcedureMs =
+        maximumProcedureMs > savedMs ? maximumProcedureMs - savedMs : 0;
   }
 
   completeCycleEmpty(now);
@@ -395,11 +720,16 @@ void updateProcedureStage(uint32_t now) {
   switch (stage) {
     case STAGE_CALIBRATION_ACTUATION:
     case STAGE_CALIBRATION_SAMPLE:
+    case STAGE_CALIBRATION_CLOSED:
+    case STAGE_CALIBRATION_PAUSE:
       updateCalibration(now);
       break;
 
     case STAGE_START_PENDING:
-      beginCycleFill(now);
+      // Procedura zaczyna się od opróżniania (cykl 0), potem n x (napełnianie + opróżnianie).
+      setMachineState(MACHINE_EMPTY, now);
+      stage = STAGE_CYCLE_EMPTY_ACTUATION;
+      stageDeadline = now + config.actuation_time;
       break;
 
     case STAGE_CALIBRATION_SETTLE:
@@ -466,9 +796,7 @@ void procedureBegin() {
   pinMode(kZ1Pin, OUTPUT);
   pinMode(kZ2Pin, OUTPUT);
   pinMode(kPumpPin, OUTPUT);
-  calibrationBaselineMa =
-      config.pump_current_baseline_tenths_ma / 10.0f;
-  baselineValid = config.pump_current_baseline_valid;
+  restoreCalibrationFromConfig();
   setMachineState(MACHINE_IDLE, millis());
 
   const uint32_t now = millis();
@@ -497,8 +825,8 @@ void procedureStart() {
   lastDisplayedSecond = UINT32_MAX;
   startBeepPattern(1, kShortBeepMs, 0, now);
 
-  displayedPhase = STATUS_FILL;
-  showStatusScreen(STATUS_FILL, 1, config.cycles, 0,
+  displayedPhase = STATUS_EMPTY;
+  showStatusScreen(STATUS_EMPTY, 1, config.cycles, 0,
                    statusMaximumSeconds());
   stage = STAGE_START_PENDING;
 }
@@ -546,6 +874,7 @@ void procedureStop() {
 
   procedureActive = false;
   stage = STAGE_IDLE;
+  restoreCalibrationFromConfig();
   setMachineState(MACHINE_IDLE, now);
   startBeepPattern(5, kFastBeepMs, kFastBeepGapMs, now);
   returnHomeScreen();
@@ -575,4 +904,153 @@ void procedureUpdate() {
 
   updateProcedureStage(now);
   publishStatus(now);
+}
+
+// Wykonuje krok trybu testowego: kalibrację albo próbkowanie prądu z detekcją odcięcia.
+// Argumenty: brak. Zwraca: brak; po zakończeniu kalibracji sygnalizuje wynik dźwiękiem.
+void procedureTestUpdate() {
+  const uint32_t now = millis();
+
+  if (procedureActive) {
+    return;
+  }
+
+  if (!testCalibrationActive) {
+    pollPumpCurrent(now);
+    return;
+  }
+
+  updateCalibration(now);
+  if (stage != STAGE_CALIBRATION_SETTLE) {
+    return;
+  }
+
+  testCalibrationActive = false;
+  stage = STAGE_IDLE;
+  if (lastCalibrationOk) {
+    testCalibrationResult = TEST_CAL_DONE;
+    startBeepPattern(2, kShortBeepMs, kFastBeepGapMs, now);
+  } else {
+    testCalibrationResult = TEST_CAL_FAILED;
+    startBeepSequence(kTestFailSequence,
+                      static_cast<uint8_t>(sizeof(kTestFailSequence) /
+                                           sizeof(kTestFailSequence[0])),
+                      now);
+  }
+  consecutiveAboveBaseline = 0;
+}
+
+// Zwraca, czy kalibracja prądu uruchomiona z trybu testowego trwa.
+// Argumenty: brak. Zwraca: stan flagi kalibracji testowej.
+bool procedureTestCalibrationRunning() {
+  return testCalibrationActive;
+}
+
+// Uruchamia kalibrację bazy prądu z trybu testowego bez startu cyklu.
+// Argumenty: brak. Zwraca: brak; włącza pompę i zeruje wynik poprzedniej kalibracji.
+void procedureTestCalibrationStart() {
+  if (procedureActive || testCalibrationActive) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  testCalibrationActive = true;
+  testCalibrationResult = TEST_CAL_IDLE;
+  consecutiveAboveBaseline = 0;
+  startCalibration(now, kCalibrationTestRuns);
+}
+
+// Przerywa kalibrację testową, wyłącza wyjścia i przywraca zapisaną bazę prądu.
+// Argumenty: brak. Zwraca: brak; sygnalizuje przerwanie szybką serią sygnałów.
+void procedureTestCalibrationAbort() {
+  if (!testCalibrationActive) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  testCalibrationActive = false;
+  testCalibrationResult = TEST_CAL_IDLE;
+  stage = STAGE_IDLE;
+  setMachineState(MACHINE_IDLE, now);
+  restoreCalibrationFromConfig();
+  consecutiveAboveBaseline = 0;
+  startBeepPattern(5, kFastBeepMs, kFastBeepGapMs, now);
+}
+
+// Wypełnia zrzut diagnostyczny trybu testowego (prąd w dziesiątych części mA).
+// Argumenty: wskaźnik na wynik. Zwraca: brak; zeruje strukturę przed wypełnieniem.
+void procedureTestGetInfo(PumpTestInfo *info) {
+  const uint32_t now = millis();
+  memset(info, 0, sizeof(*info));
+
+  info->hasSample = hasCurrentSample;
+  info->sensorOk = lastSensorOk;
+  info->currentTenthsMa = static_cast<int32_t>(lroundf(lastCurrentMa * 10.0f));
+  info->baselineValid = baselineValid;
+  info->baselineTenthsMa =
+      static_cast<int32_t>(lroundf(calibrationBaselineMa * 10.0f));
+  info->blockedTenthsMa =
+      static_cast<int32_t>(lroundf(calibrationBlockedMa * 10.0f));
+  if (baselineValid) {
+    info->levelTenthsMa = static_cast<int32_t>(lroundf(cutoffLevelMa() * 10.0f));
+    info->deltaLimitTenthsMa =
+        static_cast<int32_t>(lroundf(cutoffSlopeLimitMa() * 10.0f));
+  }
+  info->deltaTenthsMa = static_cast<int32_t>(lroundf(lastDeltaMa * 10.0f));
+  info->consecutiveSamples = consecutiveAboveBaseline;
+  info->confirmSamples = kCutoffConfirmSamples;
+  info->cutoffEnabled = kEnablePumpCutoffDetection;
+  info->cutoffDetected =
+      baselineValid && consecutiveAboveBaseline >= kCutoffConfirmSamples;
+  info->pumpOn =
+      machineState == MACHINE_EMPTY || machineState == MACHINE_CALIBRATION;
+
+  info->calPhase = testCalibrationResult;
+  if (testCalibrationActive) {
+    const uint32_t untilDeadline =
+        deadlineReached(now, stageDeadline) ? 0 : stageDeadline - now;
+    uint32_t remainingMs = untilDeadline;
+    if (stage == STAGE_CALIBRATION_PAUSE) {
+      info->calPhase = TEST_CAL_PAUSE;
+      remainingMs += kCalibrationTotalMs;
+    } else if (stage == STAGE_CALIBRATION_ACTUATION) {
+      info->calPhase = TEST_CAL_SPINUP;
+      remainingMs += kCalibrationOpenMs + kCalibrationClosedMs;
+    } else if (stage == STAGE_CALIBRATION_SAMPLE) {
+      info->calPhase = TEST_CAL_OPEN;
+      remainingMs += kCalibrationClosedMs;
+    } else {
+      info->calPhase = TEST_CAL_CLOSED;
+    }
+    // calibrationRunIndex liczy ukończone przebiegi, więc wzór jest ten sam w przerwie i w trakcie przebiegu.
+    const uint8_t runsAfterThis =
+        calibrationRunsTarget - calibrationRunIndex - 1;
+    remainingMs +=
+        runsAfterThis * (kCalibrationTotalMs + kCalibrationRunPauseMs);
+    info->calRemainingTenths = (remainingMs + 99) / 100;
+  }
+  info->calRun = calibrationRunIndex < calibrationRunsTarget
+                     ? calibrationRunIndex + 1
+                     : calibrationRunsTarget;
+  info->calRuns = calibrationRunsTarget;
+  info->calValidRuns = calibrationValidRuns;
+
+  info->calSampleCount = calibrationSampleCount;
+  if (calibrationSampleCount > 0) {
+    info->calAverageTenthsMa = static_cast<int32_t>(lroundf(
+        static_cast<float>(calibrationCurrentSumMa / calibrationSampleCount) *
+        10.0f));
+    info->calMinTenthsMa = static_cast<int32_t>(lroundf(calibrationMinMa * 10.0f));
+    info->calMaxTenthsMa = static_cast<int32_t>(lroundf(calibrationMaxMa * 10.0f));
+  }
+  if (calibrationTailCount > 0) {
+    info->calBlockedTenthsMa = static_cast<int32_t>(lroundf(
+        static_cast<float>(calibrationTailSumMa / calibrationTailCount) *
+        10.0f));
+  }
+  info->calOpenTenthsMa = static_cast<int32_t>(lroundf(lastCalOpenMa * 10.0f));
+  info->calRequiredTenthsMa =
+      static_cast<int32_t>(lroundf(lastCalRequiredMa * 10.0f));
+  info->calDeltaTenthsMa =
+      static_cast<int32_t>(lroundf(calibrationMaxDeltaMa * 10.0f));
 }

@@ -10,6 +10,7 @@
 #include "SettingsBitmaps.h"
 #include "SettingsV2Bitmaps.h"
 #include "ConfigStore.h"
+#include "Ina219.h"
 #include "Ui.h"
 #include "Procedure.h"
 
@@ -29,6 +30,10 @@ constexpr int16_t kScreenWidth = 128;
 constexpr int16_t kScreenHeight = 64;
 constexpr uint32_t kButtonDebounceMs = 25;
 constexpr uint32_t kMinimumRedrawIntervalMs = 16;
+constexpr uint8_t kTestPageManual = 0;
+constexpr uint8_t kTestPageCutoff = 1;
+constexpr uint8_t kTestPageCalibration = 2;
+constexpr uint8_t kTestPageCount = 3;
 
 Adafruit_SSD1306 display(kScreenWidth, kScreenHeight, &Wire, -1);
 
@@ -61,6 +66,10 @@ bool emptyCalibrationButtonActive = false;
 uint16_t displayedCalibrationTenths = UINT16_MAX;
 uint8_t homeManualOutputMode = 0;
 bool homeManualLockout = false;
+bool testModeActive = false;
+uint8_t testPage = kTestPageManual;
+PumpTestInfo testInfo = {};
+uint8_t testInfoAddress = 0;
 
 struct DebouncedButton {
   uint8_t pin;
@@ -325,6 +334,271 @@ void drawNumberEditScreen() {
   drawDigit(numberEditValue % 10, 70, 37, false);
 }
 
+// Zapisuje wartość w dziesiątych częściach jako tekst "123.4" z opcjonalnym znakiem plus.
+// Argumenty: bufor, rozmiar, wartość i flaga wymuszenia znaku. Zwraca: brak.
+void formatTenths(char *out, size_t size, int32_t tenths, bool forceSign) {
+  const int32_t magnitude = tenths < 0 ? -tenths : tenths;
+  snprintf(out, size, "%s%ld.%ld",
+           tenths < 0 ? "-" : (forceSign ? "+" : ""),
+           static_cast<long>(magnitude / 10),
+           static_cast<long>(magnitude % 10));
+}
+
+// Rysuje nagłówek strony testowej z tytułem i numerem strony.
+// Argumenty: tytuł. Zwraca: brak; modyfikuje bufor wyświetlacza.
+void drawTestHeader(const char *title) {
+  display.fillRect(0, 0, kScreenWidth, 11, SSD1306_WHITE);
+  drawSettingsLine(title, 2, 2, SSD1306_BLACK, SSD1306_WHITE);
+  char page[8];
+  snprintf(page, sizeof(page), "%u/%u", static_cast<unsigned>(testPage + 1),
+           static_cast<unsigned>(kTestPageCount));
+  drawSettingsLine(page, 104, 2, SSD1306_BLACK, SSD1306_WHITE);
+}
+
+// Rysuje wiersz tekstu strony testowej.
+// Argumenty: pozycja y i tekst (maks. 21 znaków). Zwraca: brak.
+void drawTestLine(int16_t y, const char *text) {
+  drawSettingsLine(text, 1, y, SSD1306_WHITE, SSD1306_BLACK);
+}
+
+// Rysuje dolny pasek strony testowej, opcjonalnie w negatywie.
+// Argumenty: tekst i flaga negatywu. Zwraca: brak; modyfikuje bufor wyświetlacza.
+void drawTestFooter(const char *text, bool inverted) {
+  if (inverted) {
+    display.fillRect(0, 53, kScreenWidth, 11, SSD1306_WHITE);
+    drawSettingsLine(text, 1, 55, SSD1306_BLACK, SSD1306_WHITE);
+  } else {
+    drawSettingsLine(text, 1, 55, SSD1306_WHITE, SSD1306_BLACK);
+  }
+}
+
+// Tworzy wiersz "PRAD: x mA" albo opis błędu odczytu z INA219.
+// Argumenty: bufor i rozmiar. Zwraca: brak.
+void formatTestCurrentLine(char *out, size_t size) {
+  if (!testInfo.hasSample) {
+    snprintf(out, size, "PRAD: ...");
+  } else if (!testInfo.sensorOk) {
+    snprintf(out, size, "PRAD: BLAD I2C");
+  } else {
+    char value[12];
+    formatTenths(value, sizeof(value), testInfo.currentTenthsMa, false);
+    snprintf(out, size, "PRAD: %s mA", value);
+  }
+}
+
+// Rysuje stronę 1 trybu testowego: duży odczyt prądu i stan sterowania ręcznego.
+// Argumenty: brak. Zwraca: brak; modyfikuje bufor wyświetlacza.
+void drawTestManualPage() {
+  drawTestHeader("TRYB TESTOWY");
+
+  if (ina219_address() != 0) {
+    char status[24];
+    snprintf(status, sizeof(status), "INA219 0x%02X OK", ina219_address());
+    drawSettingsLine(status, 18, 15, SSD1306_WHITE, SSD1306_BLACK);
+  } else {
+    drawSettingsLine("INA219: BRAK I2C", 12, 15, SSD1306_WHITE,
+                     SSD1306_BLACK);
+  }
+
+  char text[16];
+  if (!testInfo.hasSample) {
+    snprintf(text, sizeof(text), "...");
+  } else if (!testInfo.sensorOk) {
+    snprintf(text, sizeof(text), "BLAD I2C");
+  } else {
+    char value[12];
+    formatTenths(value, sizeof(value), testInfo.currentTenthsMa, false);
+    snprintf(text, sizeof(text), "%s mA", value);
+  }
+  const int16_t textWidth = static_cast<int16_t>(strlen(text)) * 12;
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+  display.setCursor((kScreenWidth - textWidth) / 2, 30);
+  display.print(text);
+
+  if (homeManualOutputMode == 1) {
+    drawSettingsLine("NAPELNIANIE", 31, 54, SSD1306_WHITE, SSD1306_BLACK, 0, 0,
+                     1UL << 4);
+  } else if (homeManualOutputMode == 2) {
+    drawSettingsLine("OPROZNIANIE", 31, 54, SSD1306_WHITE, SSD1306_BLACK,
+                     1UL << 3, 1UL << 4);
+  } else {
+    drawSettingsLine("---", 55, 54, SSD1306_WHITE, SSD1306_BLACK);
+  }
+}
+
+// Rysuje stronę 2 trybu testowego: dane do diagnostyki odcięcia pompy.
+// Argumenty: brak. Zwraca: brak; modyfikuje bufor wyświetlacza.
+void drawTestCutoffPage() {
+  drawTestHeader("ODCIECIE POMPY");
+
+  char line[28];
+  char value[12];
+  formatTestCurrentLine(line, sizeof(line));
+  drawTestLine(13, line);
+
+  if (testInfo.baselineValid) {
+    char blocked[12];
+    formatTenths(value, sizeof(value), testInfo.baselineTenthsMa, false);
+    formatTenths(blocked, sizeof(blocked), testInfo.blockedTenthsMa, false);
+    snprintf(line, sizeof(line), "OTW:%s ZAM:%s", value, blocked);
+  } else {
+    snprintf(line, sizeof(line), "OTW/ZAM: BRAK");
+  }
+  drawTestLine(21, line);
+
+  if (testInfo.baselineValid) {
+    formatTenths(value, sizeof(value), testInfo.levelTenthsMa, false);
+    snprintf(line, sizeof(line), "PROG: %s mA", value);
+  } else {
+    snprintf(line, sizeof(line), "PROG: --");
+  }
+  drawTestLine(29, line);
+
+  if (testInfo.baselineValid && testInfo.sensorOk) {
+    char limit[12];
+    formatTenths(value, sizeof(value), testInfo.deltaTenthsMa, true);
+    formatTenths(limit, sizeof(limit), testInfo.deltaLimitTenthsMa, false);
+    snprintf(line, sizeof(line), "NARAST:%s/%s", value, limit);
+  } else {
+    snprintf(line, sizeof(line), "NARAST: --");
+  }
+  drawTestLine(37, line);
+
+  snprintf(line, sizeof(line), "SPELN.:%u/%u POMPA:%s",
+           static_cast<unsigned>(testInfo.consecutiveSamples),
+           static_cast<unsigned>(testInfo.confirmSamples),
+           testInfo.pumpOn ? "ON" : "OFF");
+  drawTestLine(45, line);
+
+  if (!testInfo.cutoffEnabled) {
+    drawTestFooter("ODCIECIE: WYLACZONE", false);
+  } else if (!testInfo.baselineValid) {
+    drawTestFooter("BRAK BAZY-KALIBRUJ", false);
+  } else if (testInfo.cutoffDetected) {
+    drawTestFooter("ODCIECIE: WYKRYTE!", true);
+  } else {
+    drawTestFooter("ODCIECIE: NIE", false);
+  }
+}
+
+// Rysuje stronę 3 trybu testowego: przebieg kalibracji bazy prądu krok po kroku.
+// Argumenty: brak. Zwraca: brak; modyfikuje bufor wyświetlacza.
+void drawTestCalibrationPage() {
+  drawTestHeader("KALIBRACJA PRADU");
+
+  char line[28];
+  char value[12];
+  char value2[12];
+  formatTestCurrentLine(line, sizeof(line));
+  drawTestLine(13, line);
+
+  const uint8_t phase = testInfo.calPhase;
+  const bool running = phase == TEST_CAL_SPINUP || phase == TEST_CAL_OPEN ||
+                       phase == TEST_CAL_CLOSED || phase == TEST_CAL_PAUSE;
+
+  if (running) {
+    const char *phaseName = phase == TEST_CAL_SPINUP
+                                ? "ROZRUCH"
+                                : (phase == TEST_CAL_OPEN
+                                       ? "ZAW.OTWARTY"
+                                       : (phase == TEST_CAL_CLOSED
+                                              ? "ZAW.ZAMKN."
+                                              : "PRZERWA"));
+    snprintf(line, sizeof(line), "P%u/%u %s",
+             static_cast<unsigned>(testInfo.calRun),
+             static_cast<unsigned>(testInfo.calRuns), phaseName);
+    drawTestLine(21, line);
+    snprintf(line, sizeof(line), "POZOSTALO: %lu.%lu s",
+             static_cast<unsigned long>(testInfo.calRemainingTenths / 10),
+             static_cast<unsigned long>(testInfo.calRemainingTenths % 10));
+    drawTestLine(29, line);
+
+    if (phase == TEST_CAL_PAUSE) {
+      snprintf(line, sizeof(line), "POPRAWNE: %u/%u",
+               static_cast<unsigned>(testInfo.calValidRuns),
+               static_cast<unsigned>(testInfo.calRun - 1));
+      drawTestLine(37, line);
+    } else if (testInfo.calSampleCount > 0) {
+      formatTenths(value, sizeof(value), testInfo.calAverageTenthsMa, false);
+      snprintf(line, sizeof(line), "PROBKI:%lu SR:%s",
+               static_cast<unsigned long>(testInfo.calSampleCount), value);
+      drawTestLine(37, line);
+    } else {
+      drawTestLine(37, "PROBKI: 0");
+    }
+
+    if (phase == TEST_CAL_CLOSED) {
+      formatTenths(value, sizeof(value), testInfo.calDeltaTenthsMa, false);
+      snprintf(line, sizeof(line), "MAX NARAST: %s/0.3s", value);
+      drawTestLine(45, line);
+    } else if (phase != TEST_CAL_PAUSE) {
+      formatTenths(value, sizeof(value), testInfo.calMinTenthsMa, false);
+      formatTenths(value2, sizeof(value2), testInfo.calMaxTenthsMa, false);
+      snprintf(line, sizeof(line), "MIN:%s MAX:%s", value, value2);
+      drawTestLine(45, line);
+    }
+  } else if (phase == TEST_CAL_DONE || phase == TEST_CAL_IDLE) {
+    if (phase == TEST_CAL_DONE) {
+      snprintf(line, sizeof(line), "SREDNIA Z %u/%u PRZEB.",
+               static_cast<unsigned>(testInfo.calValidRuns),
+               static_cast<unsigned>(testInfo.calRuns));
+      drawTestLine(21, line);
+    } else {
+      drawTestLine(21, "KALIBRACJA: GOTOWA");
+    }
+    if (testInfo.baselineValid) {
+      formatTenths(value, sizeof(value), testInfo.baselineTenthsMa, false);
+      snprintf(line, sizeof(line), "OTWARTY: %s mA", value);
+      drawTestLine(29, line);
+      formatTenths(value, sizeof(value), testInfo.blockedTenthsMa, false);
+      snprintf(line, sizeof(line), "ZAMKNIETY: %s mA", value);
+      drawTestLine(37, line);
+      formatTenths(value, sizeof(value), testInfo.calDeltaTenthsMa, false);
+      snprintf(line, sizeof(line), "MAX NARAST: %s/0.3s", value);
+      drawTestLine(45, line);
+    } else {
+      drawTestLine(29, "BRAK KALIBRACJI");
+      drawTestLine(37, "5 PRZEBIEGOW, ~75 S");
+    }
+  } else {
+    drawTestLine(21, testInfo.calSampleCount == 0 && testInfo.calOpenTenthsMa == 0
+                         ? "BLAD: BRAK ODCZYTU"
+                         : "BLAD: ZA MALY WZROST");
+    char open[12];
+    char closed[12];
+    formatTenths(open, sizeof(open), testInfo.calOpenTenthsMa, false);
+    formatTenths(closed, sizeof(closed), testInfo.calBlockedTenthsMa, false);
+    snprintf(line, sizeof(line), "OTW:%s ZAM:%s", open, closed);
+    drawTestLine(29, line);
+    formatTenths(value, sizeof(value),
+                 testInfo.calBlockedTenthsMa - testInfo.calOpenTenthsMa, true);
+    formatTenths(value2, sizeof(value2), testInfo.calRequiredTenthsMa, false);
+    snprintf(line, sizeof(line), "WZROST:%s WYM:%s", value, value2);
+    drawTestLine(37, line);
+    snprintf(line, sizeof(line), "POPRAWNE: %u/%u (MIN %u)",
+             static_cast<unsigned>(testInfo.calValidRuns),
+             static_cast<unsigned>(testInfo.calRuns),
+             static_cast<unsigned>(testInfo.calRuns / 2 + 1));
+    drawTestLine(45, line);
+  }
+
+  drawTestFooter(running ? "ENK./STOP: PRZERWIJ" : "ENKODER: START",
+                 running);
+}
+
+// Rysuje aktualną stronę trybu testowego.
+// Argumenty: brak. Zwraca: brak; modyfikuje bufor wyświetlacza.
+void drawTestScreen() {
+  if (testPage == kTestPageCutoff) {
+    drawTestCutoffPage();
+  } else if (testPage == kTestPageCalibration) {
+    drawTestCalibrationPage();
+  } else {
+    drawTestManualPage();
+  }
+}
+
 // Odczytuje przycisk z eliminacją drgań styków i wykrywa zbocze wciśnięcia.
 // Argumenty: stan przycisku do aktualizacji i bieżący czas w ms.
 // Zwraca: true tylko przy potwierdzonym wciśnięciu; modyfikuje przekazany stan.
@@ -392,7 +666,16 @@ EncoderRotationResult handleRotation(int8_t direction) {
     return ENCODER_ACTION_IGNORED;
   }
 
-  if (currentScreen == SCREEN_SETTINGS) {
+  if (currentScreen == SCREEN_TEST) {
+    const int nextPage = static_cast<int>(testPage) + direction;
+    if (nextPage < 0 || nextPage >= kTestPageCount) {
+      return ENCODER_ACTION_LIMIT;
+    }
+    if (testPage == kTestPageCalibration) {
+      procedureTestCalibrationAbort();
+    }
+    testPage = static_cast<uint8_t>(nextPage);
+  } else if (currentScreen == SCREEN_SETTINGS) {
     const int nextPosition = static_cast<int>(settingsPosition) + direction;
     if (nextPosition < 0 || nextPosition > 4) {
       return ENCODER_ACTION_LIMIT;
@@ -448,6 +731,17 @@ EncoderRotationResult handleRotation(int8_t direction) {
 // konfigurację, rozpoczynać krok kalibracji lub zlecić reset.
 bool handleButtonPress() {
   if (currentScreen == SCREEN_STATUS) {
+    return false;
+  }
+
+  if (currentScreen == SCREEN_TEST) {
+    if (testPage == kTestPageCalibration) {
+      if (procedureTestCalibrationRunning()) {
+        procedureTestCalibrationAbort();
+      } else {
+        procedureTestCalibrationStart();
+      }
+    }
     return false;
   }
 
@@ -621,13 +915,20 @@ uint16_t currentCalibrationDisplayTenths(uint32_t now) {
   return measuredTimeTenths(boundedTotal);
 }
 
+// Sprawdza, czy ręczne przyciski Z1/Z2 mogą sterować wyjściami na bieżącym ekranie.
+// Argumenty: brak. Zwraca: true na ekranie głównym i stronach testu poza kalibracją.
+bool manualControlsAllowed() {
+  return currentScreen == SCREEN_HOME ||
+         (currentScreen == SCREEN_TEST && testPage != kTestPageCalibration);
+}
+
 // Obsługuje ręczne przyciski Z1/Z2 na ekranie głównym i blokadę po zmianie ekranu.
 // Argumenty: brak. Zwraca: brak; może zmieniać wyjścia procedury i tryb ręczny.
 void updateHomeManualControls() {
   const bool fillPressed = digitalRead(kFillButtonPin) == LOW;
   const bool emptyPressed = digitalRead(kEmptyButtonPin) == LOW;
 
-  if (currentScreen != SCREEN_HOME) {
+  if (!manualControlsAllowed()) {
     if (homeManualOutputMode != 0) {
       procedureSetManualOutputs(false, false);
       homeManualOutputMode = 0;
@@ -652,11 +953,31 @@ void updateHomeManualControls() {
 
   procedureSetManualOutputs(requestedMode == 1, requestedMode == 2);
   homeManualOutputMode = requestedMode;
+  if (currentScreen == SCREEN_TEST) {
+    markScreenDirty();
+  }
+}
+
+// Obsługuje tryb testowy: próbkowanie prądu, ręczne przyciski Z1/Z2 i odświeżanie ekranu.
+// Argumenty: brak. Zwraca: brak; oznacza ekran do rysowania, gdy zmieniły się dane.
+void updateTestMode() {
+  procedureTestUpdate();
+  updateHomeManualControls();
+
+  PumpTestInfo info;
+  procedureTestGetInfo(&info);
+  const uint8_t address = ina219_address();
+  if (memcmp(&info, &testInfo, sizeof(info)) != 0 ||
+      address != testInfoAddress) {
+    testInfo = info;
+    testInfoAddress = address;
+    markScreenDirty();
+  }
 }
 
 }  // namespace
 
-const Config defaultConfig = {1, 50, 100, 300, 30, 500, 0, false};
+const Config defaultConfig = {1, 50, 100, 300, 30, 500, 0, false, 0, 0};
 Config config = defaultConfig;
 int currentScreen = SCREEN_HOME;
 
@@ -687,6 +1008,13 @@ void uiBegin() {
   stopButton.changedAt = millis();
 
   displayReady = display.begin(SSD1306_SWITCHCAPVCC, kOledAddress);
+
+  // STOP wciśnięty podczas uruchomienia włącza tryb testowy.
+  delay(5);
+  testModeActive = digitalRead(kStopButtonPin) == LOW;
+  if (testModeActive) {
+    currentScreen = SCREEN_TEST;
+  }
   markScreenDirty();
 }
 
@@ -694,6 +1022,18 @@ void uiBegin() {
 // Argumenty: brak. Zwraca: brak; może wywoływać sterowanie procedurą i zmieniać UI.
 void processInput() {
   const uint32_t now = millis();
+  if (testModeActive) {
+    // STOP w trybie testowym przerywa kalibrację prądu.
+    if (pollDebouncedButton(stopButton, now) &&
+        testPage == kTestPageCalibration) {
+      procedureTestCalibrationAbort();
+    }
+    pollEncoder();
+    pollEncoderButton();
+    updateTestMode();
+    return;
+  }
+
   const bool stopPressed = pollDebouncedButton(stopButton, now);
   const bool startPressed = pollDebouncedButton(startButton, now);
 
@@ -893,6 +1233,8 @@ void updateScreen() {
     drawStatusScreen();
   } else if (currentScreen == SCREEN_TIME_CALIBRATION) {
     drawTimeCalibrationScreen();
+  } else if (currentScreen == SCREEN_TEST) {
+    drawTestScreen();
   } else {
     drawHomeScreen();
   }

@@ -9,6 +9,7 @@
 #define SCREEN_SETTINGS_NUMBER_EDIT 3
 #define SCREEN_SETTINGS_CONFIRM 4
 #define SCREEN_TIME_CALIBRATION 5
+#define SCREEN_TEST 6
 
 enum StatusPhase : uint8_t {
   STATUS_EMPTY,
@@ -23,8 +24,13 @@ struct Config {
   uint16_t empty_time;
   uint16_t max_empty_time;
   uint32_t actuation_time;
+  // Prąd pompy przy otwartym zaworze (swobodny przepływ), w dziesiątych mA.
   uint16_t pump_current_baseline_tenths_ma;
   bool pump_current_baseline_valid;
+  // Prąd pompy przy zamkniętym zaworze, w dziesiątych mA.
+  uint16_t pump_current_blocked_tenths_ma;
+  // Największy narost prądu w oknie 300 ms przy zamykaniu zaworu, w dziesiątych mA.
+  uint16_t pump_current_rise_tenths_ma;
 };
 
 extern Config config;

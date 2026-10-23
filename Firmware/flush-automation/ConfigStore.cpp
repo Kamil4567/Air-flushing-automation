@@ -10,12 +10,31 @@
 namespace {
 
 constexpr uint32_t kRecordMagic = 0x43464731;
-constexpr uint16_t kRecordVersion = 2;
+constexpr uint16_t kRecordVersion = 3;
+constexpr uint16_t kPreviousRecordVersion = 2;
 constexpr uint16_t kLegacyRecordVersion = 1;
 constexpr uint32_t kSaveDebounceMs = 750;
 constexpr size_t kEepromBufferSize = 256;
 
 struct ConfigRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint8_t cycles;
+  uint16_t fillTime;
+  uint16_t maxFillTime;
+  uint16_t emptyTime;
+  uint16_t maxEmptyTime;
+  uint32_t actuationTime;
+  uint16_t pumpCurrentBaselineTenthsMa;
+  uint8_t pumpCurrentBaselineValid;
+  uint16_t pumpCurrentBlockedTenthsMa;
+  uint16_t pumpCurrentRiseTenthsMa;
+  uint32_t crc;
+};
+
+// Układ rekordu v2 (bez danych kalibracji zamkniętego zaworu).
+struct PreviousConfigRecord {
   uint32_t magic;
   uint16_t version;
   uint16_t size;
@@ -69,6 +88,23 @@ uint32_t calculateCrc32(const uint8_t *data, size_t length) {
 // Sprawdza zakresy wartości rekordu aktualnej wersji konfiguracji.
 // Argumenty: rekord do walidacji. Zwraca: true, jeśli wszystkie pola są w zakresie.
 bool configValuesValid(const ConfigRecord &record) {
+  return record.cycles >= 1 && record.cycles <= 99 &&
+         record.fillTime >= 1 && record.fillTime <= 999 &&
+         record.maxFillTime >= 1 && record.maxFillTime <= 100 &&
+         record.emptyTime >= 1 && record.emptyTime <= 999 &&
+         record.maxEmptyTime >= 1 && record.maxEmptyTime <= 999 &&
+         record.emptyTime <= record.maxEmptyTime * 10UL &&
+         record.fillTime <= record.maxFillTime * 10UL &&
+         record.actuationTime >= 1 && record.actuationTime <= 60000 &&
+         record.pumpCurrentBaselineValid <= 1 &&
+         record.pumpCurrentBaselineTenthsMa <= 30000 &&
+         record.pumpCurrentBlockedTenthsMa <= 30000 &&
+         record.pumpCurrentRiseTenthsMa <= 30000;
+}
+
+// Sprawdza zakresy wartości rekordu konfiguracji w formacie v2.
+// Argumenty: rekord v2. Zwraca: true, jeśli jego pola są w zakresie.
+bool previousConfigValuesValid(const PreviousConfigRecord &record) {
   return record.cycles >= 1 && record.cycles <= 99 &&
          record.fillTime >= 1 && record.fillTime <= 999 &&
          record.maxFillTime >= 1 && record.maxFillTime <= 100 &&
@@ -138,6 +174,31 @@ void recordToConfig(const ConfigRecord &record, Config *config) {
       record.pumpCurrentBaselineTenthsMa;
   config->pump_current_baseline_valid =
       record.pumpCurrentBaselineValid != 0;
+  config->pump_current_blocked_tenths_ma = record.pumpCurrentBlockedTenthsMa;
+  config->pump_current_rise_tenths_ma = record.pumpCurrentRiseTenthsMa;
+}
+
+// Weryfikuje nagłówek, rozmiar, CRC i wartości rekordu w formacie v2.
+// Argumenty: rekord v2. Zwraca: true, gdy rekord można bezpiecznie migrować.
+bool previousRecordValid(const PreviousConfigRecord &record) {
+  return record.magic == kRecordMagic &&
+         record.version == kPreviousRecordVersion &&
+         record.size == sizeof(PreviousConfigRecord) &&
+         recordCrcValid(record) &&
+         previousConfigValuesValid(record);
+}
+
+// Migruje ustawienia v2. Zapisana wcześniej baza prądu pochodziła z innej metody
+// kalibracji, więc kalibracja prądu zostaje unieważniona i wymaga ponownego wykonania.
+// Argumenty: zwalidowany rekord v2. Zwraca: brak; nadpisuje globalne config.
+void migratePreviousRecord(const PreviousConfigRecord &record) {
+  config = defaultConfig;
+  config.cycles = record.cycles;
+  config.fill_time = record.fillTime;
+  config.max_fill_time = record.maxFillTime;
+  config.empty_time = record.emptyTime;
+  config.max_empty_time = record.maxEmptyTime;
+  config.actuation_time = record.actuationTime;
 }
 
 // Migruje ustawienia v1 do config, uzupełniając brakujące pola wartościami domyślnymi.
@@ -152,10 +213,7 @@ void migrateLegacyRecord(const LegacyConfigRecord &record) {
                           : static_cast<uint16_t>(migratedEmptyTime);
   config.max_empty_time = static_cast<uint16_t>(record.maxEmptyTime);
   config.actuation_time = record.actuationTime;
-  config.pump_current_baseline_tenths_ma =
-      record.pumpCurrentBaselineTenthsMa;
-  config.pump_current_baseline_valid =
-      record.pumpCurrentBaselineValid != 0;
+  // Stara baza prądu pochodzi z innej metody kalibracji; wymaga ponownej kalibracji.
 }
 
 // Buduje aktualny rekord EEPROM z globalnej konfiguracji i oblicza jego CRC.
@@ -175,6 +233,8 @@ ConfigRecord configToRecord() {
       config.pump_current_baseline_tenths_ma;
   record.pumpCurrentBaselineValid =
       config.pump_current_baseline_valid ? 1 : 0;
+  record.pumpCurrentBlockedTenthsMa = config.pump_current_blocked_tenths_ma;
+  record.pumpCurrentRiseTenthsMa = config.pump_current_rise_tenths_ma;
   record.crc = calculateCrc32(
       reinterpret_cast<const uint8_t *>(&record),
       offsetof(ConfigRecord, crc));
@@ -194,9 +254,13 @@ void configStoreBegin() {
   if (recordValid(record)) {
     recordToConfig(record, &config);
   } else {
+    PreviousConfigRecord previousRecord = {};
+    EEPROM.get(0, previousRecord);
     LegacyConfigRecord legacyRecord = {};
     EEPROM.get(0, legacyRecord);
-    if (legacyRecordValid(legacyRecord)) {
+    if (previousRecordValid(previousRecord)) {
+      migratePreviousRecord(previousRecord);
+    } else if (legacyRecordValid(legacyRecord)) {
       migrateLegacyRecord(legacyRecord);
     } else {
       config = defaultConfig;

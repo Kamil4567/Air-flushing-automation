@@ -32,11 +32,33 @@ extern "C" bool ina219_bus_read_register(
   return true;
 }
 
+// Zapisuje dwa bajty (MSB first) do wskazanego rejestru przez I2C.
+// Argumenty: adres urządzenia, numer rejestru i wartość 16-bitowa.
+// Zwraca: true, gdy urządzenie potwierdziło transakcję.
+extern "C" bool ina219_bus_write_register(
+    uint8_t address,
+    uint8_t reg,
+    uint16_t value) {
+  Wire.beginTransmission(address);
+  Wire.write(reg);
+  Wire.write(static_cast<uint8_t>(value >> 8));
+  Wire.write(static_cast<uint8_t>(value & 0xFF));
+  return Wire.endTransmission() == 0;
+}
+
+// Sprawdza, czy urządzenie odpowiada na wskazanym adresie I2C.
+// Argumenty: adres urządzenia. Zwraca: true, gdy odebrano ACK.
+extern "C" bool ina219_bus_probe(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
 // Inicjalizuje pamięć ustawień, interfejs użytkownika i sterowanie procedurą.
 // Argumenty: brak. Zwraca: brak; przygotowuje peryferia i stan firmware'u.
 void setup() {
   configStoreBegin();
   uiBegin();
+  ina219_begin();
   procedureBegin();
 }
 
