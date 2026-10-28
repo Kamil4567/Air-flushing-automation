@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "Ina219.h"
+#include "Lps28dfw.h"
 #include "ConfigStore.h"
 #include "Procedure.h"
 #include "Ui.h"
@@ -14,7 +15,8 @@ constexpr uint8_t kBuzzerPin = 0;
 constexpr uint8_t kZ1Pin = 8;
 constexpr uint8_t kZ2Pin = 9;
 constexpr uint8_t kPumpPin = 10;
-constexpr bool kEnablePumpCutoffDetection = true;
+// Metoda odcięcia pompy wybierana jest w konfiguracji (config.cutoff_method): z czujnika
+// ciśnienia, z czujnika prądu albo z obu naraz.
 constexpr uint32_t kCurrentSampleIntervalMs = 100;
 // Kalibracja: rozruch pompy, pomiar przy otwartym zaworze, potem przy zamkniętym.
 constexpr uint32_t kCalibrationSpinupMs = 2000;
@@ -29,15 +31,31 @@ constexpr float kMinCalibrationRiseMa = 5.0f;
 // Wymagany wzrost prądu to wielokrotność odchylenia standardowego prądu przy otwartym zaworze.
 constexpr float kMinRiseToNoiseRatio = 3.0f;
 // Prąd rozruchowy pompy jest pomijany w detekcji odcięcia.
-constexpr uint32_t kMonitorIgnoreMs = 1000;
+// Po włączeniu i wyłączeniu pompy silnik generuje duże skoki prądu - pomiar jest wtedy wstrzymany.
+constexpr uint32_t kPumpStartBlankMs = 1000;
+constexpr uint32_t kPumpStopBlankMs = 500;
 // Okno wygładzania i porównania: 3 próbki (300 ms) bieżące kontra 3 poprzednie.
 constexpr uint8_t kWindowSamples = 3;
 constexpr uint8_t kRingSize = 2 * kWindowSamples;
+// Filtr średniej kroczącej na surowych odczytach z INA219; liczba odczytów pochodzi
+// z config.current_filter_samples (1 = bez filtra).
+constexpr uint8_t kFilterBufferSize = MAX_CURRENT_FILTER_SAMPLES;
 constexpr float kCutoffLevelFraction = 0.5f;
 constexpr float kCutoffEarlyFraction = 0.25f;
 constexpr float kCutoffSlopeFraction = 0.5f;
 constexpr float kCutoffMinSlopeFraction = 0.1f;
-constexpr uint8_t kCutoffConfirmSamples = 3;
+// Liczba kolejnych próbek spełniających warunek odcięcia pochodzi z
+// config.cutoff_confirm_samples.
+// Zwraca aktualną liczbę próbek potwierdzających odcięcie, ograniczoną do dozwolonego zakresu.
+// Argumenty: brak. Zwraca: liczbę próbek (1 - MAX_CUTOFF_CONFIRM_SAMPLES).
+uint8_t confirmSamples() {
+  const uint8_t samples = config.cutoff_confirm_samples;
+  if (samples < 1) {
+    return 1;
+  }
+  return samples > MAX_CUTOFF_CONFIRM_SAMPLES ? MAX_CUTOFF_CONFIRM_SAMPLES
+                                              : samples;
+}
 constexpr uint16_t kShortBeepMs = 100;
 constexpr uint16_t kFastBeepMs = 80;
 constexpr uint16_t kFastBeepGapMs = 80;
@@ -116,6 +134,9 @@ double runSumOpenMa = 0.0;
 double runSumBlockedMa = 0.0;
 double runSumDeltaMa = 0.0;
 float currentRing[kRingSize] = {};
+float filterBuffer[kFilterBufferSize] = {};
+uint8_t filterHead = 0;
+uint8_t filterCount = 0;
 uint8_t ringHead = 0;
 uint8_t ringCount = 0;
 float lastDeltaMa = 0.0f;
@@ -129,8 +150,16 @@ uint8_t currentCycle = 0;
 uint8_t consecutiveAboveBaseline = 0;
 StatusPhase displayedPhase = STATUS_EMPTY;
 bool hasCurrentSample = false;
+bool pumpOutputOn = false;
+uint32_t pumpSwitchedAt = 0;
+uint32_t pumpBlankMs = 0;
 bool lastSensorOk = false;
 float lastCurrentMa = 0.0f;
+bool hasPressureSample = false;
+bool lastPressureOk = false;
+float lastPressureHpa = 0.0f;
+uint8_t pressureLowCount = 0;
+uint32_t lastPressureSampleAt = 0;
 float calibrationMinMa = 0.0f;
 float calibrationMaxMa = 0.0f;
 bool testCalibrationActive = false;
@@ -182,14 +211,28 @@ void publishStatus(uint32_t now, bool force = false) {
   }
 }
 
+// Sprawdza, czy trwa wstrzymanie pomiaru po przełączeniu pompy.
+// Argumenty: bieżący czas w ms. Zwraca: true, gdy odczyty prądu należy pomijać.
+bool measurementBlanked(uint32_t now) {
+  return now - pumpSwitchedAt < pumpBlankMs;
+}
+
 // Wyłącza wszystkie wyjścia, ustawia wyjścia właściwe dla stanu i publikuje fazę.
 // Argumenty: nowy stan maszyny i bieżący czas w ms. Zwraca: brak; zmienia GPIO,
-// machineState, displayedPhase i stan ekranu statusu.
+// machineState, displayedPhase, okno wstrzymania pomiaru i stan ekranu statusu.
 void setMachineState(MachineState nextState, uint32_t now) {
   digitalWrite(kPumpPin, LOW);
   digitalWrite(kZ1Pin, LOW);
   digitalWrite(kZ2Pin, LOW);
   machineState = nextState;
+
+  const bool pumpWanted =
+      nextState == MACHINE_EMPTY || nextState == MACHINE_CALIBRATION;
+  if (pumpWanted != pumpOutputOn) {
+    pumpOutputOn = pumpWanted;
+    pumpSwitchedAt = now;
+    pumpBlankMs = pumpWanted ? kPumpStartBlankMs : kPumpStopBlankMs;
+  }
 
   switch (machineState) {
     case MACHINE_FILL:
@@ -323,6 +366,7 @@ void beginPumpMonitor(uint32_t now) {
   emptyStartedAt = now;
   lastCurrentSampleAt = now - kCurrentSampleIntervalMs;
   consecutiveAboveBaseline = 0;
+  pressureLowCount = 0;
   resetCurrentRing();
   stage = STAGE_CYCLE_EMPTY_MONITOR;
 }
@@ -347,12 +391,85 @@ void finishProcedure(uint32_t now) {
   returnHomeScreen();
 }
 
-// Zeruje okno ostatnich próbek prądu używane do wygładzania i liczenia narostu.
-// Argumenty: brak. Zwraca: brak; zeruje licznik próbek i ostatni narost.
+// Zeruje okno ostatnich próbek prądu oraz filtr średniej kroczącej surowych odczytów.
+// Argumenty: brak. Zwraca: brak; zeruje liczniki próbek i ostatni narost.
 void resetCurrentRing() {
   ringHead = 0;
   ringCount = 0;
   lastDeltaMa = 0.0f;
+  filterHead = 0;
+  filterCount = 0;
+}
+
+// Zwraca aktualną liczbę odczytów filtra z konfiguracji, ograniczoną do dozwolonego zakresu.
+// Argumenty: brak. Zwraca: liczbę odczytów (1 - MAX_CURRENT_FILTER_SAMPLES).
+uint8_t filterWindow() {
+  const uint8_t samples = config.current_filter_samples;
+  if (samples < 1) {
+    return 1;
+  }
+  return samples > kFilterBufferSize ? kFilterBufferSize : samples;
+}
+
+// Oblicza przefiltrowaną wartość z odczytów zebranych w oknie filtru, zgodnie z typem filtra
+// z konfiguracji: średnia, mediana albo średnia obcięta (bez 20% najniższych i najwyższych).
+// Argumenty: brak. Zwraca: przefiltrowany prąd w mA z filterCount dostępnych odczytów.
+float computeFilteredCurrent() {
+  const uint8_t type = config.current_filter_type;
+  float sorted[kFilterBufferSize];
+  for (uint8_t i = 0; i < filterCount; ++i) {
+    sorted[i] = filterBuffer[i];
+  }
+
+  if (type != FILTER_TYPE_MEDIAN && type != FILTER_TYPE_TRIMMED) {
+    float sum = 0.0f;
+    for (uint8_t i = 0; i < filterCount; ++i) {
+      sum += sorted[i];
+    }
+    return sum / filterCount;
+  }
+
+  for (uint8_t i = 1; i < filterCount; ++i) {
+    const float value = sorted[i];
+    int8_t j = static_cast<int8_t>(i) - 1;
+    while (j >= 0 && sorted[j] > value) {
+      sorted[j + 1] = sorted[j];
+      --j;
+    }
+    sorted[j + 1] = value;
+  }
+
+  if (type == FILTER_TYPE_MEDIAN) {
+    const uint8_t middle = filterCount / 2;
+    return filterCount % 2 == 1 ? sorted[middle]
+                                : (sorted[middle - 1] + sorted[middle]) / 2.0f;
+  }
+
+  const uint8_t trim = filterCount / 5;
+  float sum = 0.0f;
+  for (uint8_t i = trim; i < filterCount - trim; ++i) {
+    sum += sorted[i];
+  }
+  return sum / (filterCount - 2 * trim);
+}
+
+// Dodaje surowy odczyt do okna filtru z ostatnich N wartości (N i typ filtra z konfiguracji).
+// Argumenty: surowy prąd w mA i wskaźnik na wynik. Zwraca: true, gdy okno filtru jest
+// pełne; przy niepełnym oknie wynik jest liczony z dostępnych odczytów.
+bool filterRawCurrent(float rawMa, float *filteredMa) {
+  const uint8_t window = filterWindow();
+  if (filterHead >= window) {
+    filterHead = 0;
+    filterCount = 0;
+  }
+  filterBuffer[filterHead] = rawMa;
+  filterHead = (filterHead + 1) % window;
+  if (filterCount < window) {
+    ++filterCount;
+  }
+
+  *filteredMa = computeFilteredCurrent();
+  return filterCount == window;
 }
 
 // Średnia z trzech próbek w oknie liczonym od najnowszej (offset 0) lub poprzedniej (offset 3).
@@ -385,18 +502,26 @@ void pushCurrent(float currentMa) {
                     : 0.0f;
 }
 
-// Odczytuje prąd z INA219 i zapisuje wynik w stanie diagnostycznym i oknie próbek.
-// Argumenty: brak. Zwraca: true, gdy odczyt się udał; po błędzie czyści okno próbek.
+// Odczytuje prąd z INA219, filtruje go średnią kroczącą z 10 odczytów i zapisuje wynik
+// w stanie diagnostycznym i oknie próbek.
+// Argumenty: brak. Zwraca: true, gdy odczyt się udał i filtr ma pełne okno (tylko wtedy
+// próbka trafia do detekcji i kalibracji); po błędzie czyści okno próbek i filtr.
 bool sampleCurrent() {
-  float currentMa;
-  lastSensorOk = ina219_read_current_ma(&currentMa);
+  float rawMa;
+  lastSensorOk = ina219_read_current_ma(&rawMa);
   hasCurrentSample = true;
   if (!lastSensorOk) {
     resetCurrentRing();
     return false;
   }
-  lastCurrentMa = currentMa;
-  pushCurrent(currentMa);
+
+  float filteredMa;
+  const bool filterReady = filterRawCurrent(rawMa, &filteredMa);
+  lastCurrentMa = filteredMa;
+  if (!filterReady) {
+    return false;
+  }
+  pushCurrent(filteredMa);
   return true;
 }
 
@@ -600,10 +725,18 @@ void startCalibration(uint32_t now, uint8_t runs) {
   startCalibrationRun(now);
 }
 
-// Próbkuje prąd co 100 ms i sprawdza warunek odcięcia przez 3 kolejne próbki.
-// Argumenty: bieżący czas w ms i flaga oceny warunku (false pomija rozruch pompy).
-// Zwraca: true po potwierdzonym odcięciu; aktualizuje licznik kolejnych próbek.
-bool pollPumpCurrent(uint32_t now, bool evaluate = true) {
+// Próbkuje prąd co 100 ms i sprawdza warunek odcięcia przez 10 kolejnych próbek.
+// Podczas wstrzymania po przełączeniu pompy nie mierzy i czyści okno próbek.
+// Argumenty: bieżący czas w ms. Zwraca: true po potwierdzonym odcięciu;
+// aktualizuje licznik kolejnych próbek.
+bool pollPumpCurrent(uint32_t now) {
+  if (measurementBlanked(now)) {
+    resetCurrentRing();
+    consecutiveAboveBaseline = 0;
+    lastCurrentSampleAt = now - kCurrentSampleIntervalMs;
+    return false;
+  }
+
   if (now - lastCurrentSampleAt < kCurrentSampleIntervalMs) {
     return false;
   }
@@ -614,20 +747,67 @@ bool pollPumpCurrent(uint32_t now, bool evaluate = true) {
     return false;
   }
 
-  if (!evaluate) {
-    consecutiveAboveBaseline = 0;
-    return false;
-  }
-
   if (cutoffConditionMet()) {
-    if (consecutiveAboveBaseline < kCutoffConfirmSamples) {
+    if (consecutiveAboveBaseline < confirmSamples()) {
       ++consecutiveAboveBaseline;
     }
   } else {
     consecutiveAboveBaseline = 0;
   }
 
-  return consecutiveAboveBaseline >= kCutoffConfirmSamples;
+  return consecutiveAboveBaseline >= confirmSamples();
+}
+
+// Sprawdza, czy aktualna metoda odcięcia korzysta z czujnika prądu.
+// Argumenty: brak. Zwraca: true dla metody "prąd" i "obie".
+bool currentCutoffActive() {
+  return config.cutoff_method == CUTOFF_METHOD_CURRENT ||
+         config.cutoff_method == CUTOFF_METHOD_BOTH;
+}
+
+// Sprawdza, czy aktualna metoda odcięcia korzysta z czujnika ciśnienia.
+// Argumenty: brak. Zwraca: true dla metody "ciśnienie" i "obie".
+bool pressureCutoffActive() {
+  return config.cutoff_method == CUTOFF_METHOD_PRESSURE ||
+         config.cutoff_method == CUTOFF_METHOD_BOTH;
+}
+
+// Zwraca próg ciśnienia odcięcia z konfiguracji, ograniczony do zakresu pracy czujnika.
+// Argumenty: brak. Zwraca: próg w hPa.
+uint16_t pressureThresholdHpa() {
+  const uint16_t threshold = config.pressure_cutoff_hpa;
+  if (threshold < PRESSURE_CUTOFF_MIN_HPA) {
+    return PRESSURE_CUTOFF_MIN_HPA;
+  }
+  return threshold > PRESSURE_CUTOFF_MAX_HPA ? PRESSURE_CUTOFF_MAX_HPA
+                                              : threshold;
+}
+
+// Próbkuje ciśnienie w worku co 100 ms i zlicza kolejne próbki poniżej progu.
+// Argumenty: bieżący czas w ms. Zwraca: true, gdy liczba kolejnych próbek poniżej progu
+// osiągnęła wartość potwierdzającą odcięcie; nieudany odczyt zeruje licznik.
+bool pollPressure(uint32_t now) {
+  if (now - lastPressureSampleAt >= kCurrentSampleIntervalMs) {
+    lastPressureSampleAt = now;
+
+    float hpa;
+    lastPressureOk = lps28dfw_read_pressure_hpa(&hpa);
+    hasPressureSample = true;
+    if (!lastPressureOk) {
+      pressureLowCount = 0;
+    } else {
+      lastPressureHpa = hpa;
+      if (hpa < static_cast<float>(pressureThresholdHpa())) {
+        if (pressureLowCount < confirmSamples()) {
+          ++pressureLowCount;
+        }
+      } else {
+        pressureLowCount = 0;
+      }
+    }
+  }
+
+  return pressureLowCount >= confirmSamples();
 }
 
 // Przeprowadza rozruch, pomiar przy otwartym zaworze i pomiar po jego zamknięciu.
@@ -689,13 +869,15 @@ void updateCalibration(uint32_t now) {
   }
 }
 
-// Kończy opróżnianie po wykryciu odcięcia (zamknięcia zaworu) i przechodzi dalej.
+// Kończy opróżnianie po wykryciu odcięcia i przechodzi dalej. Odcięcie wykrywa czujnik
+// ciśnienia (spadek ciśnienia w worku poniżej progu) i/lub czujnik prądu (zamknięcie
+// zaworu) - zależnie od config.cutoff_method.
 // empty_time jest tylko maksymalnym czasem opróżniania, który kończy krok awaryjnie.
 // Argumenty: bieżący czas w ms. Zwraca: brak; przy spełnieniu warunku przełącza etap.
 void updatePumpMonitor(uint32_t now) {
-  const bool cutoffDetected =
-      kEnablePumpCutoffDetection &&
-      pollPumpCurrent(now, now - emptyStartedAt >= kMonitorIgnoreMs);
+  const bool currentCutoff = currentCutoffActive() && pollPumpCurrent(now);
+  const bool pressureCutoff = pressureCutoffActive() && pollPressure(now);
+  const bool cutoffDetected = currentCutoff || pressureCutoff;
   const bool timedOut =
       now - emptyStartedAt >= config.empty_time * 100UL;
   if (!cutoffDetected && !timedOut) {
@@ -915,6 +1097,8 @@ void procedureTestUpdate() {
     return;
   }
 
+  pollPressure(now);
+
   if (!testCalibrationActive) {
     pollPumpCurrent(now);
     return;
@@ -944,6 +1128,15 @@ void procedureTestUpdate() {
 // Argumenty: brak. Zwraca: stan flagi kalibracji testowej.
 bool procedureTestCalibrationRunning() {
   return testCalibrationActive;
+}
+
+// Wczytuje parametry odcięcia z konfiguracji (po ręcznej edycji) i zeruje stan detekcji.
+// Argumenty: brak. Zwraca: brak; odcięcie jest aktywne tylko dla poprawnych parametrów.
+void procedureApplyCutoffConfig() {
+  restoreCalibrationFromConfig();
+  consecutiveAboveBaseline = 0;
+  pressureLowCount = 0;
+  resetCurrentRing();
 }
 
 // Uruchamia kalibrację bazy prądu z trybu testowego bez startu cyklu.
@@ -984,6 +1177,7 @@ void procedureTestGetInfo(PumpTestInfo *info) {
   memset(info, 0, sizeof(*info));
 
   info->hasSample = hasCurrentSample;
+  info->blanked = measurementBlanked(now);
   info->sensorOk = lastSensorOk;
   info->currentTenthsMa = static_cast<int32_t>(lroundf(lastCurrentMa * 10.0f));
   info->baselineValid = baselineValid;
@@ -998,10 +1192,19 @@ void procedureTestGetInfo(PumpTestInfo *info) {
   }
   info->deltaTenthsMa = static_cast<int32_t>(lroundf(lastDeltaMa * 10.0f));
   info->consecutiveSamples = consecutiveAboveBaseline;
-  info->confirmSamples = kCutoffConfirmSamples;
-  info->cutoffEnabled = kEnablePumpCutoffDetection;
+  info->confirmSamples = confirmSamples();
+  info->cutoffEnabled = currentCutoffActive();
   info->cutoffDetected =
-      baselineValid && consecutiveAboveBaseline >= kCutoffConfirmSamples;
+      baselineValid && consecutiveAboveBaseline >= confirmSamples();
+  info->cutoffMethod = config.cutoff_method;
+  info->hasPressure = hasPressureSample;
+  info->pressureOk = lastPressureOk;
+  info->pressureTenthsHpa =
+      static_cast<int32_t>(lroundf(lastPressureHpa * 10.0f));
+  info->pressureThresholdHpa = pressureThresholdHpa();
+  info->pressureLowSamples = pressureLowCount;
+  info->pressureCutoffEnabled = pressureCutoffActive();
+  info->pressureCutoffDetected = pressureLowCount >= confirmSamples();
   info->pumpOn =
       machineState == MACHINE_EMPTY || machineState == MACHINE_CALIBRATION;
 

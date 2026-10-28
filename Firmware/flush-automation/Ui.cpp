@@ -11,6 +11,7 @@
 #include "SettingsV2Bitmaps.h"
 #include "ConfigStore.h"
 #include "Ina219.h"
+#include "Lps28dfw.h"
 #include "Ui.h"
 #include "Procedure.h"
 
@@ -32,8 +33,26 @@ constexpr uint32_t kButtonDebounceMs = 25;
 constexpr uint32_t kMinimumRedrawIntervalMs = 16;
 constexpr uint8_t kTestPageManual = 0;
 constexpr uint8_t kTestPageCutoff = 1;
-constexpr uint8_t kTestPageCalibration = 2;
-constexpr uint8_t kTestPageCount = 3;
+constexpr uint8_t kTestPagePressure = 2;
+constexpr uint8_t kTestPageCalibration = 3;
+constexpr uint8_t kTestPageParams = 4;
+constexpr uint8_t kTestPageCount = 5;
+// Edycja parametrów odcięcia: przeglądanie stron, wybór pola, zmiana wartości.
+constexpr uint8_t kParamModeBrowse = 0;
+constexpr uint8_t kParamModeSelect = 1;
+constexpr uint8_t kParamModeEdit = 2;
+constexpr uint8_t kParamRowPressure = 0;
+constexpr uint8_t kParamRowMethod = 1;
+constexpr uint8_t kParamRowOpen = 2;
+constexpr uint8_t kParamRowClosed = 3;
+constexpr uint8_t kParamRowRise = 4;
+constexpr uint8_t kParamRowFilterType = 5;
+constexpr uint8_t kParamRowFilter = 6;
+constexpr uint8_t kParamRowConfirm = 7;
+constexpr uint8_t kParamRowCount = 8;
+constexpr uint8_t kParamVisibleRows = 5;
+constexpr int32_t kParamMaxTenths = 30000;
+constexpr uint32_t kParamFastTurnMs = 80;
 
 Adafruit_SSD1306 display(kScreenWidth, kScreenHeight, &Wire, -1);
 
@@ -68,6 +87,10 @@ uint8_t homeManualOutputMode = 0;
 bool homeManualLockout = false;
 bool testModeActive = false;
 uint8_t testPage = kTestPageManual;
+uint8_t paramMode = kParamModeBrowse;
+uint8_t paramCursor = 0;
+int32_t paramEditValue = 0;
+uint32_t lastParamTurnAt = 0;
 PumpTestInfo testInfo = {};
 uint8_t testInfoAddress = 0;
 
@@ -375,7 +398,9 @@ void drawTestFooter(const char *text, bool inverted) {
 // Tworzy wiersz "PRAD: x mA" albo opis błędu odczytu z INA219.
 // Argumenty: bufor i rozmiar. Zwraca: brak.
 void formatTestCurrentLine(char *out, size_t size) {
-  if (!testInfo.hasSample) {
+  if (testInfo.blanked) {
+    snprintf(out, size, "PRAD: PAUZA (SILNIK)");
+  } else if (!testInfo.hasSample) {
     snprintf(out, size, "PRAD: ...");
   } else if (!testInfo.sensorOk) {
     snprintf(out, size, "PRAD: BLAD I2C");
@@ -400,8 +425,21 @@ void drawTestManualPage() {
                      SSD1306_BLACK);
   }
 
+  char pressureText[28];
+  if (testInfo.hasPressure && testInfo.pressureOk) {
+    char pressureValue[12];
+    formatTenths(pressureValue, sizeof(pressureValue),
+                 testInfo.pressureTenthsHpa, false);
+    snprintf(pressureText, sizeof(pressureText), "LPS28: %s hPa", pressureValue);
+  } else {
+    snprintf(pressureText, sizeof(pressureText), "LPS28: BRAK I2C");
+  }
+  drawSettingsLine(pressureText, 12, 23, SSD1306_WHITE, SSD1306_BLACK);
+
   char text[16];
-  if (!testInfo.hasSample) {
+  if (testInfo.blanked) {
+    snprintf(text, sizeof(text), "PAUZA");
+  } else if (!testInfo.hasSample) {
     snprintf(text, sizeof(text), "...");
   } else if (!testInfo.sensorOk) {
     snprintf(text, sizeof(text), "BLAD I2C");
@@ -413,7 +451,7 @@ void drawTestManualPage() {
   const int16_t textWidth = static_cast<int16_t>(strlen(text)) * 12;
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-  display.setCursor((kScreenWidth - textWidth) / 2, 30);
+  display.setCursor((kScreenWidth - textWidth) / 2, 32);
   display.print(text);
 
   if (homeManualOutputMode == 1) {
@@ -430,7 +468,7 @@ void drawTestManualPage() {
 // Rysuje stronę 2 trybu testowego: dane do diagnostyki odcięcia pompy.
 // Argumenty: brak. Zwraca: brak; modyfikuje bufor wyświetlacza.
 void drawTestCutoffPage() {
-  drawTestHeader("ODCIECIE POMPY");
+  drawTestHeader("ODCIECIE PRADOWE");
 
   char line[28];
   char value[12];
@@ -587,13 +625,248 @@ void drawTestCalibrationPage() {
                  running);
 }
 
+// Rysuje stronę 3 trybu testowego: ciśnienie z czujnika LPS28DFW, próg i stan odcięcia
+// ciśnieniowego.
+// Argumenty: brak. Zwraca: brak; modyfikuje bufor wyświetlacza.
+void drawTestPressurePage() {
+  drawTestHeader("CISNIENIE");
+
+  char line[28];
+  char value[12];
+  if (lps28dfw_address() != 0) {
+    snprintf(line, sizeof(line), "LPS28DFW 0x%02X OK", lps28dfw_address());
+  } else {
+    snprintf(line, sizeof(line), "LPS28DFW: BRAK I2C");
+  }
+  drawTestLine(13, line);
+
+  if (testInfo.hasPressure && testInfo.pressureOk) {
+    formatTenths(value, sizeof(value), testInfo.pressureTenthsHpa, false);
+    const int16_t width = static_cast<int16_t>(strlen(value)) * 12;
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    display.setCursor(4, 23);
+    display.print(value);
+    drawSettingsLine("hPa", 4 + width + 4, 30, SSD1306_WHITE, SSD1306_BLACK);
+  } else {
+    drawSettingsLine(testInfo.hasPressure ? "BLAD ODCZYTU" : "...", 4, 27,
+                     SSD1306_WHITE, SSD1306_BLACK);
+  }
+
+  snprintf(line, sizeof(line), "PROG: %ld hPa",
+           static_cast<long>(testInfo.pressureThresholdHpa));
+  drawTestLine(39, line);
+  snprintf(line, sizeof(line), "PONIZEJ: %u/%u PROB",
+           static_cast<unsigned>(testInfo.pressureLowSamples),
+           static_cast<unsigned>(testInfo.confirmSamples));
+  drawTestLine(46, line);
+
+  if (!testInfo.pressureCutoffEnabled) {
+    drawTestFooter("CISN. NIEUZYWANE", false);
+  } else if (testInfo.pressureCutoffDetected) {
+    drawTestFooter("ODCIECIE: WYKRYTE!", true);
+  } else {
+    drawTestFooter("ODCIECIE: NIE", false);
+  }
+}
+
+// Zwraca zapisany parametr w jednostkach edycji: pole 0 to próg ciśnienia (hPa), pole 1
+// to metoda odcięcia, pola 2-4 to prąd w dziesiątych mA (przy otwartym zaworze, przy
+// zamkniętym i największy narost w 300 ms), pole 5 to typ filtra prądu, pole 6 to liczba
+// odczytów filtra prądu, pole 7 to liczba próbek potwierdzających odcięcie.
+// Argumenty: numer pola. Zwraca: wartość z konfiguracji.
+int32_t paramStoredValue(uint8_t row) {
+  switch (row) {
+    case kParamRowPressure:
+      return config.pressure_cutoff_hpa;
+    case kParamRowMethod:
+      return config.cutoff_method;
+    case kParamRowOpen:
+      return config.pump_current_baseline_tenths_ma;
+    case kParamRowClosed:
+      return config.pump_current_blocked_tenths_ma;
+    case kParamRowRise:
+      return config.pump_current_rise_tenths_ma;
+    case kParamRowFilterType:
+      return config.current_filter_type;
+    case kParamRowFilter:
+      return config.current_filter_samples;
+    default:
+      return config.cutoff_confirm_samples;
+  }
+}
+
+// Sprawdza, czy pole jest prądem w dziesiątych mA (wyświetlanym z częścią dziesiętną).
+// Argumenty: numer pola. Zwraca: true dla pól otwarty/zamknięty/narost.
+bool paramIsCurrent(uint8_t row) {
+  return row >= kParamRowOpen && row <= kParamRowRise;
+}
+
+// Dolna granica edycji pola.
+// Argumenty: numer pola. Zwraca: najmniejszą dozwoloną wartość.
+int32_t paramMinValue(uint8_t row) {
+  switch (row) {
+    case kParamRowPressure:
+      return PRESSURE_CUTOFF_MIN_HPA;
+    case kParamRowFilter:
+    case kParamRowConfirm:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+// Górna granica edycji pola.
+// Argumenty: numer pola. Zwraca: największą dozwoloną wartość.
+int32_t paramMaxValue(uint8_t row) {
+  switch (row) {
+    case kParamRowPressure:
+      return PRESSURE_CUTOFF_MAX_HPA;
+    case kParamRowMethod:
+      return CUTOFF_METHOD_COUNT - 1;
+    case kParamRowFilterType:
+      return FILTER_TYPE_COUNT - 1;
+    case kParamRowFilter:
+      return MAX_CURRENT_FILTER_SAMPLES;
+    case kParamRowConfirm:
+      return MAX_CUTOFF_CONFIRM_SAMPLES;
+    default:
+      return kParamMaxTenths;
+  }
+}
+
+// Krok zmiany wartości pola przy obrocie enkodera.
+// Argumenty: numer pola i flaga szybkiego obrotu. Zwraca: krok (prąd: 1 mA lub 10 mA,
+// ciśnienie: 1 lub 10 hPa, pozostałe pola: 1).
+int32_t paramStep(uint8_t row, bool fast) {
+  if (paramIsCurrent(row)) {
+    return fast ? 100 : 10;
+  }
+  return row == kParamRowPressure && fast ? 10 : 1;
+}
+
+// Zapisuje parametr do konfiguracji. Parametry prądu oznaczają kalibrację jako ustawioną ręcznie.
+// Argumenty: numer pola i wartość w jednostkach edycji. Zwraca: brak; żąda zapisu do EEPROM
+// i przekazuje nowe wartości do pomiaru ciśnienia i prądu oraz detekcji odcięcia.
+void paramCommit(uint8_t row, int32_t value) {
+  switch (row) {
+    case kParamRowPressure:
+      config.pressure_cutoff_hpa = static_cast<uint16_t>(value);
+      break;
+    case kParamRowMethod:
+      config.cutoff_method = static_cast<uint8_t>(value);
+      break;
+    case kParamRowOpen:
+      config.pump_current_baseline_tenths_ma = static_cast<uint16_t>(value);
+      break;
+    case kParamRowClosed:
+      config.pump_current_blocked_tenths_ma = static_cast<uint16_t>(value);
+      break;
+    case kParamRowRise:
+      config.pump_current_rise_tenths_ma = static_cast<uint16_t>(value);
+      break;
+    case kParamRowFilterType:
+      config.current_filter_type = static_cast<uint8_t>(value);
+      break;
+    case kParamRowFilter:
+      config.current_filter_samples = static_cast<uint8_t>(value);
+      break;
+    default:
+      config.cutoff_confirm_samples = static_cast<uint8_t>(value);
+      break;
+  }
+  if (paramIsCurrent(row)) {
+    config.pump_current_baseline_valid = true;
+  }
+  configStoreRequestSave();
+  procedureApplyCutoffConfig();
+}
+
+// Rysuje stronę 5 trybu testowego: ręczna edycja progu ciśnienia, metody odcięcia,
+// parametrów odcięcia prądowego i filtra prądu.
+// Widoczne jest 5 pól naraz; lista przewija się razem z kursorem.
+// Argumenty: brak. Zwraca: brak; modyfikuje bufor wyświetlacza.
+void drawTestParamsPage() {
+  static const char *const labels[kParamRowCount] = {
+      "PROG CISN[hPa]:", "ODCIECIE:", "OTWARTY[mA]:", "ZAMKNIETY[mA]:",
+      "NARAST/0.3s:", "FILTR:", "FILTR[PROBKI]:", "PROBY ODCIECIA:"};
+  static const char *const filterNames[FILTER_TYPE_COUNT] = {
+      "SREDNIA", "MEDIANA", "SR.OBCIETA"};
+  static const char *const methodNames[CUTOFF_METHOD_COUNT] = {
+      "CISNIENIE", "PRAD", "OBA"};
+  drawTestHeader("PARAMETRY");
+
+  uint8_t firstRow = 0;
+  if (paramMode != kParamModeBrowse && paramCursor >= kParamVisibleRows) {
+    firstRow = paramCursor - kParamVisibleRows + 1;
+    if (firstRow > kParamRowCount - kParamVisibleRows) {
+      firstRow = kParamRowCount - kParamVisibleRows;
+    }
+  }
+
+  for (uint8_t slot = 0; slot < kParamVisibleRows; ++slot) {
+    const uint8_t row = firstRow + slot;
+    const int16_t y = 12 + slot * 8;
+    const bool selected = paramMode != kParamModeBrowse && paramCursor == row;
+    const bool editing = paramMode == kParamModeEdit && selected;
+    const uint16_t foreground = editing ? SSD1306_BLACK : SSD1306_WHITE;
+    const uint16_t background = editing ? SSD1306_WHITE : SSD1306_BLACK;
+
+    char value[12];
+    const int32_t shown = editing ? paramEditValue : paramStoredValue(row);
+    if (row == kParamRowMethod) {
+      snprintf(value, sizeof(value), "%s",
+               methodNames[shown < CUTOFF_METHOD_COUNT ? shown : 0]);
+    } else if (row == kParamRowFilterType) {
+      snprintf(value, sizeof(value), "%s",
+               filterNames[shown < FILTER_TYPE_COUNT ? shown : 0]);
+    } else if (paramIsCurrent(row)) {
+      formatTenths(value, sizeof(value), shown, false);
+    } else {
+      snprintf(value, sizeof(value), "%ld", static_cast<long>(shown));
+    }
+    if (editing) {
+      display.fillRect(7, y - 1, 121, 9, SSD1306_WHITE);
+    }
+    if (selected) {
+      drawSettingsLine(">", 1, y, SSD1306_WHITE, SSD1306_BLACK);
+    }
+    drawSettingsLine(labels[row], 8, y, foreground, background);
+    drawSettingsLine(value,
+                     126 - static_cast<int16_t>(strlen(value)) * 6, y,
+                     foreground, background);
+  }
+
+  // Dolny wiersz: podpowiedź przy edycji i pozycji POWROT, w pozostałych przypadkach
+  // ciśnienie i prąd.
+  if (paramMode == kParamModeEdit) {
+    drawTestFooter("OBROT / ENK: ZAPISZ", true);
+  } else if (paramMode == kParamModeSelect && paramCursor >= kParamRowCount) {
+    drawTestFooter("> POWROT", true);
+  } else {
+    char line[28];
+    char value[12];
+    if (testInfo.hasPressure && testInfo.pressureOk) {
+      formatTenths(value, sizeof(value), testInfo.pressureTenthsHpa, false);
+      snprintf(line, sizeof(line), "P:%s hPa", value);
+    } else {
+      snprintf(line, sizeof(line), "P: BRAK");
+    }
+    drawTestLine(54, line);
+  }
+}
+
 // Rysuje aktualną stronę trybu testowego.
 // Argumenty: brak. Zwraca: brak; modyfikuje bufor wyświetlacza.
 void drawTestScreen() {
   if (testPage == kTestPageCutoff) {
     drawTestCutoffPage();
+  } else if (testPage == kTestPagePressure) {
+    drawTestPressurePage();
   } else if (testPage == kTestPageCalibration) {
     drawTestCalibrationPage();
+  } else if (testPage == kTestPageParams) {
+    drawTestParamsPage();
   } else {
     drawTestManualPage();
   }
@@ -667,14 +940,38 @@ EncoderRotationResult handleRotation(int8_t direction) {
   }
 
   if (currentScreen == SCREEN_TEST) {
-    const int nextPage = static_cast<int>(testPage) + direction;
-    if (nextPage < 0 || nextPage >= kTestPageCount) {
-      return ENCODER_ACTION_LIMIT;
+    if (testPage == kTestPageParams && paramMode == kParamModeSelect) {
+      const int nextCursor = static_cast<int>(paramCursor) + direction;
+      if (nextCursor < 0 || nextCursor > kParamRowCount) {
+        return ENCODER_ACTION_LIMIT;
+      }
+      paramCursor = static_cast<uint8_t>(nextCursor);
+    } else if (testPage == kTestPageParams && paramMode == kParamModeEdit) {
+      // Prąd: szybki obrót zmienia wartość o 10 mA, wolny o 1 mA; filtr: o 1 odczyt.
+      const uint32_t now = millis();
+      const int32_t step =
+          paramStep(paramCursor, now - lastParamTurnAt < kParamFastTurnMs);
+      lastParamTurnAt = now;
+      int32_t nextValue = paramEditValue + direction * step;
+      const int32_t minValue = paramMinValue(paramCursor);
+      const int32_t maxValue = paramMaxValue(paramCursor);
+      nextValue = nextValue < minValue
+                      ? minValue
+                      : (nextValue > maxValue ? maxValue : nextValue);
+      if (nextValue == paramEditValue) {
+        return ENCODER_ACTION_LIMIT;
+      }
+      paramEditValue = nextValue;
+    } else {
+      const int nextPage = static_cast<int>(testPage) + direction;
+      if (nextPage < 0 || nextPage >= kTestPageCount) {
+        return ENCODER_ACTION_LIMIT;
+      }
+      if (testPage == kTestPageCalibration) {
+        procedureTestCalibrationAbort();
+      }
+      testPage = static_cast<uint8_t>(nextPage);
     }
-    if (testPage == kTestPageCalibration) {
-      procedureTestCalibrationAbort();
-    }
-    testPage = static_cast<uint8_t>(nextPage);
   } else if (currentScreen == SCREEN_SETTINGS) {
     const int nextPosition = static_cast<int>(settingsPosition) + direction;
     if (nextPosition < 0 || nextPosition > 4) {
@@ -735,6 +1032,26 @@ bool handleButtonPress() {
   }
 
   if (currentScreen == SCREEN_TEST) {
+    if (testPage == kTestPageParams) {
+      if (paramMode == kParamModeBrowse) {
+        paramMode = kParamModeSelect;
+        paramCursor = 0;
+      } else if (paramMode == kParamModeSelect) {
+        if (paramCursor >= kParamRowCount) {
+          paramMode = kParamModeBrowse;
+        } else {
+          paramEditValue = paramStoredValue(paramCursor);
+          lastParamTurnAt = millis();
+          paramMode = kParamModeEdit;
+        }
+      } else {
+        paramCommit(paramCursor, paramEditValue);
+        paramMode = kParamModeSelect;
+      }
+      markScreenDirty();
+      return true;
+    }
+
     if (testPage == kTestPageCalibration) {
       if (procedureTestCalibrationRunning()) {
         procedureTestCalibrationAbort();
@@ -977,7 +1294,12 @@ void updateTestMode() {
 
 }  // namespace
 
-const Config defaultConfig = {1, 50, 100, 300, 30, 500, 0, false, 0, 0};
+const Config defaultConfig = {1, 50, 100, 300, 30, 500, 0, false, 0, 0,
+                              DEFAULT_CURRENT_FILTER_SAMPLES,
+                              DEFAULT_CUTOFF_CONFIRM_SAMPLES,
+                              FILTER_TYPE_AVERAGE,
+                              DEFAULT_PRESSURE_CUTOFF_HPA,
+                              CUTOFF_METHOD_PRESSURE};
 Config config = defaultConfig;
 int currentScreen = SCREEN_HOME;
 
@@ -1023,10 +1345,16 @@ void uiBegin() {
 void processInput() {
   const uint32_t now = millis();
   if (testModeActive) {
-    // STOP w trybie testowym przerywa kalibrację prądu.
-    if (pollDebouncedButton(stopButton, now) &&
-        testPage == kTestPageCalibration) {
-      procedureTestCalibrationAbort();
+    // STOP w trybie testowym przerywa kalibrację prądu albo wycofuje edycję parametrów.
+    if (pollDebouncedButton(stopButton, now)) {
+      if (testPage == kTestPageCalibration) {
+        procedureTestCalibrationAbort();
+      } else if (testPage == kTestPageParams &&
+                 paramMode != kParamModeBrowse) {
+        paramMode = paramMode == kParamModeEdit ? kParamModeSelect
+                                                : kParamModeBrowse;
+        markScreenDirty();
+      }
     }
     pollEncoder();
     pollEncoderButton();

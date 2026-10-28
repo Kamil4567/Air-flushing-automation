@@ -12,11 +12,12 @@ Program jest podzielony na kilka modułów:
 
 | Plik | Odpowiedzialność |
 | --- | --- |
-| [flush-automation.ino](./flush-automation.ino) | Punkt wejścia Arduino. W `setup()` inicjalizuje pamięć konfiguracji, UI i sterowanie procedurą. W `loop()` kolejno obsługuje wejścia, odświeża ekran, aktualizuje automat procedury i obsługuje odroczony zapis. Udostępnia też odczyt rejestru INA219 przez I2C. |
+| [flush-automation.ino](./flush-automation.ino) | Punkt wejścia Arduino. W `setup()` inicjalizuje pamięć konfiguracji, UI i sterowanie procedurą. W `loop()` kolejno obsługuje wejścia, odświeża ekran, aktualizuje automat procedury i obsługuje odroczony zapis. Udostępnia też odczyt rejestru INA219 i dostęp do rejestrów LPS28DFW przez I2C. |
 | [Ui.cpp](./Ui.cpp), [Ui.h](./Ui.h) | Obsługa OLED, wejść, ekranów, konfiguracji edytowanej przez użytkownika i kalibracji czasów. Udostępnia strukturę `Config` współdzieloną z pozostałymi modułami. |
 | [Procedure.cpp](./Procedure.cpp), [Procedure.h](./Procedure.h) | Nieblokujący automat procedury, sterowanie wyjściami, nadzór prądu pompy, sygnały dźwiękowe i reset programowy. |
 | [ConfigStore.cpp](./ConfigStore.cpp), [ConfigStore.h](./ConfigStore.h) | Odczyt, walidacja, migracja i zapis konfiguracji w EEPROM. |
 | [Ina219.c](./Ina219.c), [Ina219.h](./Ina219.h) | Odczyt rejestru prądu ze znakiem czujnika INA219 i przeliczenie wyniku na mA. |
+| [Lps28dfw.c](./Lps28dfw.c), [Lps28dfw.h](./Lps28dfw.h) | Sterownik czujnika ciśnienia LPS28DFW: wykrycie adresu, konfiguracja i odczyt ciśnienia w hPa. |
 | `*Bitmaps.h` | Bitmapy ekranów i cyfr używane przez UI. |
 | [diagram.json](./diagram.json), `chips/ina219.chip.c`, `chips/ina219.chip.json` | Schemat połączeń Wokwi oraz model symulowanego czujnika prądu. |
 
@@ -112,6 +113,35 @@ Wyjścia są ustawiane centralnie przez zmianę stanu maszyny:
 | Opróżnianie | Z2 i pompa |
 | Kalibracja prądu | Pompa |
 
+### Metoda odcięcia pompy i czujnik ciśnienia
+
+Odcięcie pompy kończy krok opróżniania (`empty_time` jest tylko maksymalnym
+czasem opróżniania). Metodę detekcji wybiera się w ukrytym menu (tryb
+testowy, strona 5, pole `ODCIECIE`; `config.cutoff_method`):
+
+- `CISNIENIE` (domyślnie) - spadek ciśnienia w worku poniżej progu, czujnik
+  LPS28DFW;
+- `PRAD` - wykrywanie z czujnika prądu INA219 (opisane niżej);
+- `OBA` - odcięcie, gdy wykryje je którakolwiek z metod.
+
+Zawsze w trybie testowym mierzone są oba czujniki, niezależnie od wybranej
+metody. Gdy wybrana metoda nie ma poprawnego odczytu (np. czujnik ciśnienia
+nie odpowiada), nie ma odcięcia i krok kończy się limitem `empty_time`.
+
+`Lps28dfw.c` obsługuje czujnik ciśnienia LPS28DFW na wspólnej magistrali I2C
+(GP4/GP5) pod adresem `0x5C` (SA0 = GND) albo `0x5D` (SA0 = VDD); adres jest
+wykrywany automatycznie, a identyfikator `WHO_AM_I` musi mieć wartość `0xB4`.
+Czujnik pracuje w trybie ciągłym (25 Hz, uśrednianie 16 próbek, zakres
+1260 hPa, 4096 LSB/hPa), a wynik 24-bitowy jest przeliczany na hPa. Odczyt
+spoza zakresu pracy (np. zero tuż po starcie) jest odrzucany. Po błędzie
+komunikacji czujnik jest wyszukiwany i konfigurowany ponownie.
+
+Ciśnienie jest próbkowane co 100 ms podczas opróżniania. Odcięcie
+ciśnieniowe jest zgłaszane, gdy przez M kolejnych próbek (to samo
+`cutoff_confirm_samples` co dla prądu, domyślnie 10 = 1 s) ciśnienie jest
+niższe niż `pressure_cutoff_hpa` (domyślnie 850 hPa, zakres 260-1260 hPa,
+ustawiane w ukrytym menu w polu `PROG CISN[hPa]`). Nieudany odczyt zeruje licznik.
+
 ### Pomiar prądu i ważna uwaga o kalibracji
 
 `Ina219.c` odczytuje rejestr prądu `0x04` czujnika INA219 pod adresem I2C
@@ -119,9 +149,31 @@ Wyjścia są ustawiane centralnie przez zmianę stanu maszyny:
 krok rejestru odpowiada `0,1 mA`. Odczyt rejestru przez `Wire` zapewnia szkic
 Arduino.
 
-Wykrywanie odcięcia jest włączone. Podczas opróżniania (po 1 s rozruchu pompy)
-prąd jest próbkowany co 100 ms i wygładzany średnią z 3 próbek (300 ms).
-Odcięcie (zamknięcie zaworu) jest zgłaszane, gdy przez 3 kolejne próbki
+Surowe odczyty z INA219 są najpierw filtrowane z ostatnich N wartości
+(`current_filter_samples`, domyślnie 10, zakres 1-30; 1 wyłącza filtr). Typ
+filtra (`current_filter_type`) wybiera się na stronie 5 trybu testowego (pole
+`FILTR`):
+
+- `SREDNIA` - średnia krocząca (domyślnie): wygładza szum, ale pojedynczy skok
+  prądu przesuwa wynik o 1/N wartości skoku;
+- `MEDIANA` - środkowa wartość z okna: całkowicie odrzuca krótkie skoki (do
+  około N/2 odczytów), lecz mniej wygładza szum i reaguje skokowo;
+- `SR.OBCIETA` - średnia obcięta: z posortowanych odczytów odrzuca 20%
+  najniższych i 20% najwyższych, a z reszty liczy średnią. Łączy odporność na
+  zakłócenia silnika z wygładzaniem szumu i jest polecana dla tego układu.
+
+Liczbę odczytów (`FILTR[PROBKI]`) i typ filtra zapisuje się w EEPROM z trybu
+testowego (strona 5). Dalsza analiza, kalibracja i wyświetlany prąd korzystają już z wartości
+przefiltrowanych. Do detekcji i kalibracji próbki trafiają dopiero, gdy okno
+filtru jest pełne (filtr jest zerowany razem z oknem próbek, więc po
+wstrzymaniu pomiaru potrzeba N odczytów); w tym czasie wyświetlana jest
+wartość liczona z dostępnych odczytów.
+
+Odcięcie prądowe (metoda `PRAD` lub `OBA`): przefiltrowany prąd
+jest dodatkowo wygładzany średnią z 3 próbek (300 ms).
+Odcięcie (zamknięcie zaworu) jest zgłaszane, gdy przez M kolejnych próbek
+(`cutoff_confirm_samples`, domyślnie 10 = 1 s, zakres 1-50, ustawiane na stronie
+5 trybu testowego w polu `PROBY ODCIECIA`)
 spełniony jest jeden z warunków: średni prąd osiągnął połowę drogi między
 prądem przy otwartym i zamkniętym zaworze, albo narost prądu w 300 ms
 (średnia bieżąca minus poprzednia) przekracza połowę największego narostu
@@ -131,16 +183,47 @@ procedura przechodzi dalej. `empty_time` jest tylko maksymalnym czasem
 opróżniania: kończy krok awaryjnie, gdy odcięcie nie zostanie wykryte.
 Nieudany odczyt zeruje okno próbek i licznik.
 
+Włączanie i wyłączanie pompy powoduje duże skoki prądu silnika, dlatego
+pomiar jest wstrzymywany: 1 s po włączeniu i 0,5 s po wyłączeniu pompy
+(`kPumpStartBlankMs`, `kPumpStopBlankMs`). W tym czasie nie są wykonywane
+odczyty, a okno próbek i licznik odcięcia są zerowane; po wstrzymaniu
+wygładzanie zaczyna się od nowa. W trybie testowym zamiast prądu widać wtedy
+komunikat `PAUZA`.
+
 Zwykły start procedury nie wykonuje kalibracji; korzysta z danych zapisanych
 w EEPROM (prąd przy otwartym zaworze, przy zamkniętym zaworze i największy
 narost). Bez poprawnej kalibracji wykrywanie nie działa i cykl kończy się
 limitem `empty_time`.
 
 Kalibrację prądu wykonuje się w trybie testowym (włączenie z wciśniętym
-przyciskiem STOP, strona 3): 5 przebiegów, każdy to rozruch pompy z otwartym
+przyciskiem STOP, strona 4): 5 przebiegów, każdy to rozruch pompy z otwartym
 zaworem Z2, pomiar prądu swobodnego przepływu, a następnie zamknięcie zaworu
 Z2 przy pracującej pompie i pomiar prądu oraz narostu. Wynik jest średnią z
 poprawnych przebiegów (wymagana ich większość) i jest zapisywany w EEPROM.
+
+Parametry odcięcia można ustawić ręcznie na stronie 5 trybu testowego:
+próg ciśnienia (hPa), metoda odcięcia, prąd przy otwartym zaworze, prąd przy
+zamkniętym zaworze i największy narost
+prądu w 0,3 s (wszystko w mA), typ filtra prądu, liczba odczytów filtra oraz liczba
+kolejnych próbek potwierdzających odcięcie. Enkoder
+przełącza strony; na stronie 5 jego naciśnięcie wchodzi do wyboru pola, obrót
+przesuwa kursor (ostatnia pozycja to `POWROT`), a naciśnięcie wybiera pole do
+edycji. W edycji obrót zmienia wartość (prąd: wolno 1 mA, szybko 10 mA; ciśnienie:
+1 hPa lub 10 hPa; pozostałe pola: co 1), naciśnięcie zapisuje ją w EEPROM i od
+razu stosuje, a STOP wycofuje edycję. Odcięcie prądowe jest aktywne, gdy prąd
+przy zamkniętym zaworze jest większy niż przy otwartym, a narost jest większy od
+zera. Strona pokazuje 5 pól naraz i przewija się razem z kursorem. Automatyczna
+kalibracja (strona 4) nadal działa i nadpisuje wartości prądu (nie zmienia
+progu ciśnienia ani liczb próbek).
+
+Strony trybu testowego (enkoder przełącza strony, przyciski ręczne
+napełniania/opróżniania działają na wszystkich poza kalibracją):
+
+1. Sterowanie ręczne, prąd z INA219 i ciśnienie z LPS28DFW.
+2. Diagnostyka odcięcia prądowego.
+3. Ciśnienie, próg, licznik próbek poniżej progu i stan odcięcia ciśnieniowego.
+4. Kalibracja prądu (5 przebiegów).
+5. Parametry odcięcia.
 
 ## Konfiguracja
 
@@ -179,8 +262,8 @@ symulowane.
 | GP1 | START |
 | GP2 | STOP |
 | GP3 | Enkoder – CLK |
-| GP4 | I2C SDA: OLED i INA219 |
-| GP5 | I2C SCL: OLED i INA219 |
+| GP4 | I2C SDA: OLED, INA219 i LPS28DFW |
+| GP5 | I2C SCL: OLED, INA219 i LPS28DFW |
 | GP6 | Enkoder – DT |
 | GP7 | Przycisk enkodera |
 | GP8 | Wyjście Z1 (napełnianie) |

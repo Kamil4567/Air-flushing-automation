@@ -22,6 +22,8 @@ struct PumpTestInfo {
   int32_t levelTenthsMa;
   int32_t deltaTenthsMa;
   int32_t deltaLimitTenthsMa;
+  int32_t pressureTenthsHpa;
+  int32_t pressureThresholdHpa;
   int32_t calAverageTenthsMa;
   int32_t calMinTenthsMa;
   int32_t calMaxTenthsMa;
@@ -34,10 +36,17 @@ struct PumpTestInfo {
   uint8_t consecutiveSamples;
   uint8_t confirmSamples;
   uint8_t calPhase;
+  uint8_t pressureLowSamples;
+  uint8_t cutoffMethod;
   uint8_t calRun;
   uint8_t calRuns;
   uint8_t calValidRuns;
   bool hasSample;
+  bool hasPressure;
+  bool pressureOk;
+  bool pressureCutoffEnabled;
+  bool pressureCutoffDetected;
+  bool blanked;
   bool sensorOk;
   bool cutoffEnabled;
   bool baselineValid;
@@ -80,6 +89,9 @@ void procedureTestUpdate();
 void procedureTestGetInfo(PumpTestInfo *info);
 // Zwraca, czy kalibracja prądu uruchomiona z trybu testowego trwa.
 bool procedureTestCalibrationRunning();
+// Wczytuje parametry odcięcia z konfiguracji po ich ręcznej edycji.
+// Argumenty/wartość zwrotna: brak; zeruje stan detekcji odcięcia.
+void procedureApplyCutoffConfig();
 // Uruchamia kalibrację bazy prądu (pompa włączona) bez rozpoczynania cyklu.
 // Argumenty/wartość zwrotna: brak; wynik jest zapisywany do konfiguracji.
 void procedureTestCalibrationStart();

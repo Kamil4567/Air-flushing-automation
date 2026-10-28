@@ -10,6 +10,25 @@
 #define SCREEN_SETTINGS_CONFIRM 4
 #define SCREEN_TIME_CALIBRATION 5
 #define SCREEN_TEST 6
+#define MAX_CURRENT_FILTER_SAMPLES 30
+#define DEFAULT_CURRENT_FILTER_SAMPLES 10
+#define MAX_CUTOFF_CONFIRM_SAMPLES 50
+#define DEFAULT_CUTOFF_CONFIRM_SAMPLES 10
+// Typy filtra prądu: średnia krocząca, mediana, średnia obcięta (bez 20% skrajnych wartości).
+#define FILTER_TYPE_AVERAGE 0
+#define FILTER_TYPE_MEDIAN 1
+#define FILTER_TYPE_TRIMMED 2
+#define FILTER_TYPE_COUNT 3
+// Metoda detekcji odcięcia pompy: z czujnika ciśnienia, z czujnika prądu albo obie
+// (odcięcie, gdy wykryje je którakolwiek).
+#define CUTOFF_METHOD_PRESSURE 0
+#define CUTOFF_METHOD_CURRENT 1
+#define CUTOFF_METHOD_BOTH 2
+#define CUTOFF_METHOD_COUNT 3
+// Próg ciśnienia (hPa) w worku, poniżej którego pompa jest odcinana.
+#define PRESSURE_CUTOFF_MIN_HPA 260
+#define PRESSURE_CUTOFF_MAX_HPA 1260
+#define DEFAULT_PRESSURE_CUTOFF_HPA 850
 
 enum StatusPhase : uint8_t {
   STATUS_EMPTY,
@@ -31,6 +50,16 @@ struct Config {
   uint16_t pump_current_blocked_tenths_ma;
   // Największy narost prądu w oknie 300 ms przy zamykaniu zaworu, w dziesiątych mA.
   uint16_t pump_current_rise_tenths_ma;
+  // Liczba ostatnich odczytów w filtrze średniej kroczącej prądu (1 = bez filtra).
+  uint8_t current_filter_samples;
+  // Liczba kolejnych próbek spełniających warunek, potrzebna do uznania odcięcia.
+  uint8_t cutoff_confirm_samples;
+  // Typ filtra prądu (FILTER_TYPE_*).
+  uint8_t current_filter_type;
+  // Próg ciśnienia odcięcia w hPa (odcięcie przy ciśnieniu poniżej progu).
+  uint16_t pressure_cutoff_hpa;
+  // Metoda detekcji odcięcia (CUTOFF_METHOD_*).
+  uint8_t cutoff_method;
 };
 
 extern Config config;
