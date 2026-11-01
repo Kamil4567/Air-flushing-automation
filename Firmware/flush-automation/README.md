@@ -3,8 +3,6 @@
 Firmware jest przeznaczony dla Raspberry Pi Pico (RP2040). Steruje zaworami
 oraz pompą, wykonuje cykle napełniania i opróżniania, obsługuje wyświetlacz
 OLED, enkoder i przyciski, a ustawienia przechowuje w emulowanej pamięci EEPROM.
-W katalogu znajduje się również projekt połączeń i model czujnika INA219 dla
-symulatora Wokwi.
 
 ## Architektura
 
@@ -19,7 +17,6 @@ Program jest podzielony na kilka modułów:
 | [Ina219.c](./Ina219.c), [Ina219.h](./Ina219.h) | Odczyt rejestru prądu ze znakiem czujnika INA219 i przeliczenie wyniku na mA. |
 | [Lps28dfw.c](./Lps28dfw.c), [Lps28dfw.h](./Lps28dfw.h) | Sterownik czujnika ciśnienia LPS28DFW: wykrycie adresu, konfiguracja i odczyt ciśnienia w hPa. |
 | `*Bitmaps.h` | Bitmapy ekranów i cyfr używane przez UI. |
-| [diagram.json](./diagram.json), `chips/ina219.chip.c`, `chips/ina219.chip.json` | Schemat połączeń Wokwi oraz model symulowanego czujnika prądu. |
 
 Moduły komunikują się przez interfejsy w plikach nagłówkowych. UI zmienia
 wspólną konfigurację i przekazuje zdarzenia do procedury; procedura z kolei
@@ -87,17 +84,21 @@ limit, limit jest automatycznie podnoszony do wymaganej pełnej sekundy.
 
 ## Automat procedury
 
-Automat w `Procedure.cpp` zaczyna od jednorazowego opróżniania (kroki 4-6
-poniżej), a następnie wykonuje `cycles` razy następujący przebieg:
+Procedura składa się z dwóch części:
 
-1. Włącza Z1 (napełnianie) na czas `actuation_time`.
-2. Utrzymuje napełnianie przez `fill_time`.
-3. Wyłącza wyjścia i odczekuje `actuation_time`.
-4. Włącza Z2 i pompę na czas `actuation_time`.
-5. Monitoruje prąd pompy; wykrycie odcięcia kończy krok, a `empty_time` jest
-   maksymalnym czasem opróżniania.
-6. Wyłącza wyjścia i odczekuje `actuation_time`.
-7. Rozpoczyna następny cykl lub kończy procedurę.
+1. **Wstępne opróżnianie** (cykl 0): Z2 jest otwierany, odczekiwane jest
+   `actuation_time`, następnie włącza się pompa i monitorowanie odcięcia trwa do
+   upływu `empty_time`. Na koniec wyjścia są wyłączane i odczekiwane jest
+   `actuation_time`.
+2. **Cykle** (`cycles` razy), każdy z dwóch faz:
+   - napełnianie: Z1 jest otwierany, odczekiwane jest `actuation_time`, a
+     następnie napełnianie trwa `fill_time * 100` ms. Wyjścia są wyłączane i
+     odczekiwane jest `actuation_time`;
+   - opróżnianie: Z2 jest otwierany, odczekiwane jest `actuation_time`, a
+     następnie pompa i monitorowanie odcięcia trwają do upływu `empty_time`.
+     Wyjścia są wyłączane i odczekiwane jest `actuation_time`.
+
+Po ostatnim cyklu procedura kończy się i odtwarzana jest sekwencja dźwiękowa.
 
 Podczas zakończenia normalnego odtwarzana jest seria trzech sygnałów 3 kHz
 (każdy 333 ms, przerwy 100 ms). STOP
@@ -253,8 +254,7 @@ zapisywane z opóźnieniem, aby ograniczyć częstotliwość zapisów pamięci.
 
 ## Połączenia sprzętowe
 
-Mapowanie pinów wynika z firmware’u; schemat Wokwi przedstawia połączenia
-symulowane.
+Mapowanie pinów wynika z firmware’u i odpowiada fizycznemu urządzeniu.
 
 | GPIO Pico | Funkcja |
 | --- | --- |
@@ -273,11 +273,9 @@ symulowane.
 | GP17 | Przycisk ręcznego napełniania / kalibracji |
 
 Przyciski w firmware mają włączone wewnętrzne podciąganie do stanu wysokiego
-i są aktywne stanem niskim. GPIO GP16 i GP17 są używane przez kod, ale nie są
-podłączone w dostarczonym `diagram.json`; należy dodać je do symulacji lub
-podłączyć w urządzeniu, jeśli mają być używane.
+i są aktywne stanem niskim.
 
-## Budowanie i symulacja
+## Budowanie
 
 `libraries.txt` wymienia biblioteki Arduino: Adafruit SSD1306 i Adafruit GFX.
 Szkic korzysta także z API Arduino dla RP2040, `Wire`, `EEPROM` oraz
@@ -285,6 +283,6 @@ watchdoga sprzętowego Pico. W katalogu nie ma osobnego manifestu budowania ani
 konfiguracji testów — wybierz w środowisku Arduino płytkę Raspberry Pi Pico
 (RP2040) i doinstaluj biblioteki z `libraries.txt`.
 
-Do symulacji Wokwi otwórz `diagram.json`. Model niestandardowego czujnika
-INA219 jest opisany w `chips/ina219.chip.json` i zaimplementowany w
-`chips/ina219.chip.c`.
+Pliki `diagram.json`, `chips/` i `wokwi.toml` pochodzą z wczesnej fazy projektu,
+kiedy urządzenie było testowane w symulatorze Wokwi. Nie opisują one fizycznego
+układu i nie są potrzebne do budowania firmware.
