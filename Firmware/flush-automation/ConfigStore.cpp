@@ -10,7 +10,8 @@
 namespace {
 
 constexpr uint32_t kRecordMagic = 0x43464731;
-constexpr uint16_t kRecordVersion = 7;
+constexpr uint16_t kRecordVersion = 8;
+constexpr uint16_t kVersion7RecordVersion = 7;
 constexpr uint16_t kVersion6RecordVersion = 6;
 constexpr uint16_t kVersion5RecordVersion = 5;
 constexpr uint16_t kVersion4RecordVersion = 4;
@@ -21,6 +22,29 @@ constexpr uint32_t kSaveDebounceMs = 750;
 constexpr size_t kEepromBufferSize = 256;
 
 struct ConfigRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint8_t cycles;
+  uint16_t fillTime;
+  uint16_t maxFillTime;
+  uint16_t emptyTime;
+  uint16_t maxEmptyTime;
+  uint32_t actuationTime;
+  uint16_t pumpCurrentBaselineTenthsMa;
+  uint8_t pumpCurrentBaselineValid;
+  uint16_t pumpCurrentBlockedTenthsMa;
+  uint16_t pumpCurrentRiseTenthsMa;
+  uint8_t currentFilterSamples;
+  uint8_t cutoffConfirmSamples;
+  uint8_t currentFilterType;
+  uint16_t pressureCutoffHpa;
+  uint8_t cutoffMethod;
+  uint32_t crc;
+};
+
+// Układ rekordu v7 (czas opróżniania w dziesiątych sekundy).
+struct Version7ConfigRecord {
   uint32_t magic;
   uint16_t version;
   uint16_t size;
@@ -172,15 +196,41 @@ uint32_t calculateCrc32(const uint8_t *data, size_t length) {
   return ~crc;
 }
 
-// Sprawdza zakresy wartości rekordu aktualnej wersji konfiguracji.
-// Argumenty: rekord do walidacji. Zwraca: true, jeśli wszystkie pola są w zakresie.
-bool configValuesValid(const ConfigRecord &record) {
+// Sprawdza zakresy wartości rekordu konfiguracji w formacie v7 (czas w dziesiątych sekundy).
+// Argumenty: rekord v7. Zwraca: true, jeśli jego pola są w zakresie.
+bool version7ConfigValuesValid(const Version7ConfigRecord &record) {
   return record.cycles >= 1 && record.cycles <= 99 &&
          record.fillTime >= 1 && record.fillTime <= 999 &&
          record.maxFillTime >= 1 && record.maxFillTime <= 100 &&
          record.emptyTime >= 1 && record.emptyTime <= 999 &&
          record.maxEmptyTime >= 1 && record.maxEmptyTime <= 999 &&
          record.emptyTime <= record.maxEmptyTime * 10UL &&
+         record.fillTime <= record.maxFillTime * 10UL &&
+         record.actuationTime >= 1 && record.actuationTime <= 60000 &&
+         record.pumpCurrentBaselineValid <= 1 &&
+         record.pumpCurrentBaselineTenthsMa <= 30000 &&
+         record.pumpCurrentBlockedTenthsMa <= 30000 &&
+         record.pumpCurrentRiseTenthsMa <= 30000 &&
+         record.currentFilterSamples >= 1 &&
+         record.currentFilterSamples <= MAX_CURRENT_FILTER_SAMPLES &&
+         record.cutoffConfirmSamples >= 1 &&
+         record.cutoffConfirmSamples <= MAX_CUTOFF_CONFIRM_SAMPLES &&
+         record.currentFilterType < FILTER_TYPE_COUNT &&
+         record.pressureCutoffHpa >= PRESSURE_CUTOFF_MIN_HPA &&
+         record.pressureCutoffHpa <= PRESSURE_CUTOFF_MAX_HPA &&
+         record.cutoffMethod < CUTOFF_METHOD_COUNT;
+}
+
+// Sprawdza zakresy wartości rekordu aktualnej wersji konfiguracji.
+// Argumenty: rekord do walidacji. Zwraca: true, jeśli wszystkie pola są w zakresie.
+bool configValuesValid(const ConfigRecord &record) {
+  return record.cycles >= 1 && record.cycles <= 99 &&
+         record.fillTime >= 1 && record.fillTime <= 999 &&
+         record.maxFillTime >= 1 && record.maxFillTime <= 100 &&
+         record.emptyTime >= 1 && record.emptyTime <= MAX_EMPTY_TIME_SECONDS &&
+         record.maxEmptyTime >= 1 &&
+         record.maxEmptyTime <= MAX_EMPTY_TIME_SECONDS &&
+         record.emptyTime <= record.maxEmptyTime &&
          record.fillTime <= record.maxFillTime * 10UL &&
          record.actuationTime >= 1 && record.actuationTime <= 60000 &&
          record.pumpCurrentBaselineValid <= 1 &&
@@ -355,6 +405,37 @@ void recordToConfig(const ConfigRecord &record, Config *config) {
   config->current_filter_type = record.currentFilterType;
   config->pressure_cutoff_hpa = record.pressureCutoffHpa;
   config->cutoff_method = record.cutoffMethod;
+}
+
+// Weryfikuje nagłówek, rozmiar, CRC i wartości rekordu w formacie v7.
+// Argumenty: rekord v7. Zwraca: true, gdy rekord można bezpiecznie migrować.
+bool version7RecordValid(const Version7ConfigRecord &record) {
+  return record.magic == kRecordMagic &&
+         record.version == kVersion7RecordVersion &&
+         record.size == sizeof(Version7ConfigRecord) &&
+         recordCrcValid(record) &&
+         version7ConfigValuesValid(record);
+}
+
+// Migruje ustawienia v7: wszystko jest zachowane oprócz czasu opróżniania,
+// który w configStoreBegin jest resetowany do wartości domyślnej.
+// Argumenty: zwalidowany rekord v7. Zwraca: brak; nadpisuje globalne config.
+void migrateVersion7Record(const Version7ConfigRecord &record) {
+  config = defaultConfig;
+  config.cycles = record.cycles;
+  config.fill_time = record.fillTime;
+  config.max_fill_time = record.maxFillTime;
+  config.max_empty_time = record.maxEmptyTime;
+  config.actuation_time = record.actuationTime;
+  config.pump_current_baseline_tenths_ma = record.pumpCurrentBaselineTenthsMa;
+  config.pump_current_baseline_valid = record.pumpCurrentBaselineValid != 0;
+  config.pump_current_blocked_tenths_ma = record.pumpCurrentBlockedTenthsMa;
+  config.pump_current_rise_tenths_ma = record.pumpCurrentRiseTenthsMa;
+  config.current_filter_samples = record.currentFilterSamples;
+  config.cutoff_confirm_samples = record.cutoffConfirmSamples;
+  config.current_filter_type = record.currentFilterType;
+  config.pressure_cutoff_hpa = record.pressureCutoffHpa;
+  config.cutoff_method = record.cutoffMethod;
 }
 
 // Weryfikuje nagłówek, rozmiar, CRC i wartości rekordu w formacie v6.
@@ -550,6 +631,8 @@ void configStoreBegin() {
   if (recordValid(record)) {
     recordToConfig(record, &config);
   } else {
+    Version7ConfigRecord version7Record = {};
+    EEPROM.get(0, version7Record);
     Version6ConfigRecord version6Record = {};
     EEPROM.get(0, version6Record);
     Version5ConfigRecord version5Record = {};
@@ -562,7 +645,9 @@ void configStoreBegin() {
     EEPROM.get(0, previousRecord);
     LegacyConfigRecord legacyRecord = {};
     EEPROM.get(0, legacyRecord);
-    if (version6RecordValid(version6Record)) {
+    if (version7RecordValid(version7Record)) {
+      migrateVersion7Record(version7Record);
+    } else if (version6RecordValid(version6Record)) {
       migrateVersion6Record(version6Record);
     } else if (version5RecordValid(version5Record)) {
       migrateVersion5Record(version5Record);
@@ -577,6 +662,8 @@ void configStoreBegin() {
     } else {
       config = defaultConfig;
     }
+    // Rekordy v1–v7 przechowywały czas opróżniania w dziesiątych sekundy, więc jest resetowany.
+    config.empty_time = defaultConfig.empty_time;
     configStoreRequestSave();
   }
 }

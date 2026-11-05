@@ -332,7 +332,7 @@ void updateBeeper(uint32_t now) {
 uint32_t calculateMaximumProcedureMs() {
   const uint64_t actuation = config.actuation_time;
   const uint64_t emptyDuration =
-      static_cast<uint64_t>(config.empty_time) * 100;
+      static_cast<uint64_t>(config.empty_time) * 1000;
   const uint64_t fillDuration =
       static_cast<uint64_t>(config.fill_time) * 100;
   const uint64_t initialEmpty = 2 * actuation + emptyDuration;
@@ -879,13 +879,13 @@ void updatePumpMonitor(uint32_t now) {
   const bool pressureCutoff = pressureCutoffActive() && pollPressure(now);
   const bool cutoffDetected = currentCutoff || pressureCutoff;
   const bool timedOut =
-      now - emptyStartedAt >= config.empty_time * 100UL;
+      now - emptyStartedAt >= config.empty_time * 1000UL;
   if (!cutoffDetected && !timedOut) {
     return;
   }
 
   // Wcześniejsze odcięcie skraca szacowany całkowity czas o niewykorzystany limit.
-  const uint32_t limitMs = config.empty_time * 100UL;
+  const uint32_t limitMs = config.empty_time * 1000UL;
   const uint32_t usedMs = now - emptyStartedAt;
   if (usedMs < limitMs) {
     const uint32_t savedMs = limitMs - usedMs;

@@ -119,6 +119,44 @@
       }
     },
     {
+      "type": "wokwi-pushbutton",
+      "id": "btn3",
+      "top": -387.4,
+      "left": 300.8,
+      "attrs": {
+        "color": "blue",
+        "xray": ""
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn4",
+      "top": -320.2,
+      "left": 300.8,
+      "attrs": {
+        "color": "yellow",
+        "xray": ""
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "text6",
+      "top": -374.4,
+      "left": 380,
+      "attrs": {
+        "text": "NAPELNIANIE"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "text7",
+      "top": -307.2,
+      "left": 380,
+      "attrs": {
+        "text": "OPROZNIANIE"
+      }
+    },
+    {
       "type": "wokwi-buzzer",
       "id": "bz1",
       "top": -542.1,
@@ -341,6 +379,30 @@
       "led3:C",
       "pico:GND.1",
       "black",
+      []
+    ],
+    [
+      "pico:GND.1",
+      "btn3:1.r",
+      "black",
+      []
+    ],
+    [
+      "pico:GND.1",
+      "btn4:1.r",
+      "black",
+      []
+    ],
+    [
+      "pico:GP17",
+      "btn3:2.r",
+      "blue",
+      []
+    ],
+    [
+      "pico:GP16",
+      "btn4:2.r",
+      "gold",
       []
     ],
 

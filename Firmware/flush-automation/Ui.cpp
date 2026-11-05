@@ -4,7 +4,7 @@
 #include <hardware/watchdog.h>
 
 #include "UIBitmaps.h"
-#include "HomeV2Bitmaps.h"
+#include "HomeV2MinutesBitmaps.h"
 #include "TimeCalibrationBitmaps.h"
 #include "StatusBitmaps.h"
 #include "SettingsBitmaps.h"
@@ -58,6 +58,8 @@ Adafruit_SSD1306 display(kScreenWidth, kScreenHeight, &Wire, -1);
 
 int cursorPosition = 0;
 int selectedOption = -1;
+// Pole edycji czasu napełniania: 0 = minuty, 1 = sekundy. Używane tylko dla selectedOption == 2.
+uint8_t emptyTimeField = 0;
 int8_t encoderAccumulator = 0;
 uint8_t previousEncoderState = 0;
 bool lastButtonReading = HIGH;
@@ -75,6 +77,8 @@ uint32_t statusMaximumSeconds = 0;
 uint8_t settingsPosition = 0;
 uint8_t confirmSelection = 0;
 uint32_t numberEditValue = 1;
+// Pole edycji maksymalnego czasu opróżniania: 0 = minuty, 1 = sekundy.
+uint8_t numberEditField = 0;
 uint8_t timeCalibrationStep = 0;
 uint32_t fillCalibrationElapsedMs = 0;
 uint32_t emptyCalibrationElapsedMs = 0;
@@ -82,7 +86,7 @@ uint32_t fillCalibrationStartedAt = 0;
 uint32_t emptyCalibrationStartedAt = 0;
 bool fillCalibrationButtonActive = false;
 bool emptyCalibrationButtonActive = false;
-uint16_t displayedCalibrationTenths = UINT16_MAX;
+uint16_t displayedCalibrationValue = UINT16_MAX;
 uint8_t homeManualOutputMode = 0;
 bool homeManualLockout = false;
 bool testModeActive = false;
@@ -124,7 +128,7 @@ void markScreenDirty() {
   screenDirty = true;
 }
 
-uint16_t currentCalibrationDisplayTenths(uint32_t now);
+uint16_t currentCalibrationDisplayValue(uint32_t now);
 
 // Wybiera bitmapę ekranu głównego zgodnie z zaznaczonym polem lub kursorem.
 // Argumenty: brak. Zwraca: wskaźnik do bitmapy; nie zmienia stanu UI.
@@ -136,7 +140,7 @@ const uint8_t *homeBackground() {
     return HOME_V2_SELECTED_1;
   }
   if (selectedOption == 2) {
-    return HOME_V2_SELECTED_2;
+    return emptyTimeField == 0 ? HOME_V2_SELECTED_2 : HOME_V2_SELECTED_3;
   }
 
   switch (cursorPosition) {
@@ -160,6 +164,23 @@ void drawDigit(uint8_t digit, int16_t x, int16_t y, bool inverted) {
   display.drawBitmap(x, y, FONT_DIGITS[digit], 8, 12, foreground, background);
 }
 
+// Litery "m" (5x4) i "s" (4x7) jak na ekranie głównym; bit MSB to lewa kolumna.
+constexpr uint8_t kMinuteGlyph[4] = {0x50, 0xA8, 0xA8, 0xA8};
+constexpr uint8_t kSecondGlyph[7] = {0x60, 0x90, 0x80, 0x60, 0x10, 0x90, 0x60};
+
+// Rysuje literę z bitmapy bitów w podanym kolorze; bity wyzerowane nie są zmieniane.
+// Argumenty: wiersze, szerokość, wysokość, pozycja x/y i kolor. Zwraca: brak.
+void drawGlyph(const uint8_t *rows, uint8_t width, uint8_t height, int16_t x,
+               int16_t y, uint16_t color) {
+  for (uint8_t row = 0; row < height; ++row) {
+    for (uint8_t column = 0; column < width; ++column) {
+      if (rows[row] & (0x80 >> column)) {
+        display.drawPixel(x + column, y + row, color);
+      }
+    }
+  }
+}
+
 // Rysuje ekran główny z konfiguracją oraz zaznaczeniem aktywnego pola.
 // Argumenty: brak. Zwraca: brak; odczytuje config i modyfikuje bufor OLED.
 void drawHomeScreen() {
@@ -167,18 +188,32 @@ void drawHomeScreen() {
                      SSD1306_WHITE);
 
   const bool cyclesInverted = selectedOption == 0;
-  drawDigit(config.cycles / 10, 16, 2, cyclesInverted);
-  drawDigit(config.cycles % 10, 26, 2, cyclesInverted);
+  drawDigit(config.cycles / 10, 13, 2, cyclesInverted);
+  drawDigit(config.cycles % 10, 23, 2, cyclesInverted);
 
   const bool fillTimeInverted = selectedOption == 1;
-  drawDigit(config.fill_time / 100, 16, 17, fillTimeInverted);
-  drawDigit((config.fill_time / 10) % 10, 26, 17, fillTimeInverted);
-  drawDigit(config.fill_time % 10, 40, 17, fillTimeInverted);
+  drawDigit(config.fill_time / 100, 13, 17, fillTimeInverted);
+  drawDigit((config.fill_time / 10) % 10, 23, 17, fillTimeInverted);
+  drawDigit(config.fill_time % 10, 37, 17, fillTimeInverted);
 
-  const bool emptyTimeInverted = selectedOption == 2;
-  drawDigit(config.empty_time / 100, 16, 34, emptyTimeInverted);
-  drawDigit((config.empty_time / 10) % 10, 26, 34, emptyTimeInverted);
-  drawDigit(config.empty_time % 10, 40, 34, emptyTimeInverted);
+  const uint8_t emptyMinutes = (config.empty_time / 60) % 100;
+  const uint8_t emptySeconds = config.empty_time % 60;
+  const bool emptyMinutesInverted = selectedOption == 2 && emptyTimeField == 0;
+  const bool emptySecondsInverted = selectedOption == 2 && emptyTimeField == 1;
+  drawDigit(emptyMinutes / 10, 13, 34, emptyMinutesInverted);
+  drawDigit(emptyMinutes % 10, 23, 34, emptyMinutesInverted);
+  drawDigit(emptySeconds / 10, 39, 34, emptySecondsInverted);
+  drawDigit(emptySeconds % 10, 49, 34, emptySecondsInverted);
+}
+
+// Rysuje wynik kroku 3 kalibracji jako "000s" w białym polu; odstępy między znakami to 2 px.
+// Argumenty: czas w pełnych sekundach. Zwraca: brak; modyfikuje bufor OLED.
+void drawEmptyCalibrationSeconds(uint16_t seconds) {
+  display.fillRect(86, 23, 42, 15, SSD1306_WHITE);
+  drawDigit(seconds / 100, 89, 26, true);
+  drawDigit((seconds / 10) % 10, 99, 26, true);
+  drawDigit(seconds % 10, 109, 26, true);
+  drawGlyph(kSecondGlyph, 4, 7, 119, 31, SSD1306_BLACK);
 }
 
 // Rysuje ekran aktualnego kroku kalibracji czasu oraz wartość pomiaru.
@@ -193,11 +228,13 @@ void drawTimeCalibrationScreen() {
   display.drawBitmap(0, 0, bitmap, kScreenWidth, kScreenHeight,
                      SSD1306_WHITE);
 
-  if (timeCalibrationStep == 2 || timeCalibrationStep == 3) {
-    const uint16_t tenths = currentCalibrationDisplayTenths(millis());
+  if (timeCalibrationStep == 2) {
+    const uint16_t tenths = currentCalibrationDisplayValue(millis());
     drawDigit(tenths / 100, 88, 26, true);
     drawDigit((tenths / 10) % 10, 98, 26, true);
     drawDigit(tenths % 10, 112, 26, true);
+  } else if (timeCalibrationStep == 3) {
+    drawEmptyCalibrationSeconds(currentCalibrationDisplayValue(millis()));
   }
 }
 
@@ -337,7 +374,32 @@ const uint8_t *confirmBackground() {
   return confirmSelection == 0 ? CONFIRM_REBOOT_NO : CONFIRM_REBOOT_YES;
 }
 
-// Rysuje ekran edycji limitu czasu napełniania albo opróżniania.
+// Rysuje edycję maksymalnego czasu opróżniania w formacie 00m 00s jak na ekranie głównym.
+// Argumenty: brak. Zwraca: brak; czyta numberEditValue i numberEditField, modyfikuje bufor OLED.
+void drawMaxEmptyTimeEditor() {
+  display.fillRect(36, 33, 56, 18, SSD1306_BLACK);
+  const uint32_t minutes = (numberEditValue / 60) % 100;
+  const uint32_t seconds = numberEditValue % 60;
+  const bool minutesSelected = numberEditField == 0;
+  const bool secondsSelected = numberEditField == 1;
+  if (minutesSelected) {
+    display.fillRoundRect(36, 35, 27, 17, 3, SSD1306_WHITE);
+  }
+  if (secondsSelected) {
+    display.fillRoundRect(65, 35, 26, 17, 3, SSD1306_WHITE);
+  }
+
+  drawDigit(minutes / 10, 38, 37, minutesSelected);
+  drawDigit(minutes % 10, 48, 37, minutesSelected);
+  drawGlyph(kMinuteGlyph, 5, 4, 57, 45,
+            minutesSelected ? SSD1306_BLACK : SSD1306_WHITE);
+  drawDigit(seconds / 10, 67, 37, secondsSelected);
+  drawDigit(seconds % 10, 77, 37, secondsSelected);
+  drawGlyph(kSecondGlyph, 4, 7, 86, 42,
+            secondsSelected ? SSD1306_BLACK : SSD1306_WHITE);
+}
+
+// Rysuje ekran edycji limitu czasu napełniania albo maksymalnego czasu opróżniania.
 // Argumenty: brak. Zwraca: brak; odczytuje stan edycji i modyfikuje bufor OLED.
 void drawNumberEditScreen() {
   display.drawBitmap(0, 0,
@@ -350,11 +412,12 @@ void drawNumberEditScreen() {
                      SSD1306_WHITE);
     drawSettingsLine("NAPELNIANIA", 31, 12, SSD1306_BLACK, SSD1306_WHITE,
                      0, 0, 1UL << 4);
+    drawDigit((numberEditValue / 100) % 10, 50, 37, false);
+    drawDigit((numberEditValue / 10) % 10, 60, 37, false);
+    drawDigit(numberEditValue % 10, 70, 37, false);
+  } else {
+    drawMaxEmptyTimeEditor();
   }
-
-  drawDigit((numberEditValue / 100) % 10, 50, 37, false);
-  drawDigit((numberEditValue / 10) % 10, 60, 37, false);
-  drawDigit(numberEditValue % 10, 70, 37, false);
 }
 
 // Zapisuje wartość w dziesiątych częściach jako tekst "123.4" z opcjonalnym znakiem plus.
@@ -914,6 +977,7 @@ void selectSettingsItem() {
       break;
     case 3:
       numberEditValue = config.max_empty_time;
+      numberEditField = 0;
       currentScreen = SCREEN_SETTINGS_NUMBER_EDIT;
       break;
     case 4:
@@ -979,12 +1043,23 @@ EncoderRotationResult handleRotation(int8_t direction) {
     }
     settingsPosition = static_cast<uint8_t>(nextPosition);
   } else if (currentScreen == SCREEN_SETTINGS_NUMBER_EDIT) {
-    const uint32_t maximum = settingsPosition == 2 ? 100 : 999;
-    const int64_t nextValue = static_cast<int64_t>(numberEditValue) + direction;
-    if (nextValue < 1 || nextValue > maximum) {
-      return ENCODER_ACTION_LIMIT;
+    if (settingsPosition == 2) {
+      const int64_t nextValue =
+          static_cast<int64_t>(numberEditValue) + direction;
+      if (nextValue < 1 || nextValue > 100) {
+        return ENCODER_ACTION_LIMIT;
+      }
+      numberEditValue = static_cast<uint32_t>(nextValue);
+    } else {
+      // Jak na ekranie głównym: minuty zmieniają wartość o 60 s, sekundy o 1 s.
+      const int64_t step = numberEditField == 0 ? 60 : 1;
+      const int64_t nextValue =
+          static_cast<int64_t>(numberEditValue) + direction * step;
+      if (nextValue < 1 || nextValue > MAX_EMPTY_TIME_SECONDS) {
+        return ENCODER_ACTION_LIMIT;
+      }
+      numberEditValue = static_cast<uint32_t>(nextValue);
     }
-    numberEditValue = static_cast<uint32_t>(nextValue);
   } else if (currentScreen == SCREEN_SETTINGS_CONFIRM) {
     const int nextSelection = static_cast<int>(confirmSelection) + direction;
     if (nextSelection < 0 || nextSelection > 1) {
@@ -1007,11 +1082,11 @@ EncoderRotationResult handleRotation(int8_t direction) {
     }
     config.fill_time = static_cast<uint16_t>(nextValue);
   } else if (selectedOption == 2) {
-    const int32_t nextValue = static_cast<int32_t>(config.empty_time) + direction;
-    const uint32_t maximum =
-        static_cast<uint32_t>(config.max_empty_time) * 10;
-    const uint32_t boundedMaximum = maximum < 999 ? maximum : 999;
-    if (nextValue < 1 || nextValue > boundedMaximum) {
+    // Minuty zmieniają wartość o 60 s, sekundy o 1 s; zakres to 1 s..max_empty_time.
+    const int32_t step = emptyTimeField == 0 ? 60 : 1;
+    const int32_t nextValue =
+        static_cast<int32_t>(config.empty_time) + direction * step;
+    if (nextValue < 1 || nextValue > config.max_empty_time) {
       return ENCODER_ACTION_LIMIT;
     }
     config.empty_time = static_cast<uint16_t>(nextValue);
@@ -1079,12 +1154,14 @@ bool handleButtonPress() {
       if (config.fill_time > maximum) {
         config.fill_time = maximum > 999 ? 999 : maximum;
       }
+    } else if (numberEditField == 0) {
+      numberEditField = 1;
+      markScreenDirty();
+      return true;
     } else {
-      config.max_empty_time = numberEditValue;
-      const uint16_t maximum =
-          static_cast<uint16_t>(config.max_empty_time * 10UL);
-      if (config.empty_time > maximum) {
-        config.empty_time = maximum > 999 ? 999 : maximum;
+      config.max_empty_time = static_cast<uint16_t>(numberEditValue);
+      if (config.empty_time > config.max_empty_time) {
+        config.empty_time = config.max_empty_time;
       }
     }
     configStoreRequestSave();
@@ -1103,13 +1180,17 @@ bool handleButtonPress() {
   }
 
   if (currentScreen == SCREEN_HOME) {
-    if (selectedOption >= 0) {
+    if (selectedOption == 2 && emptyTimeField == 0) {
+      emptyTimeField = 1;
+    } else if (selectedOption >= 0) {
       selectedOption = -1;
+      emptyTimeField = 0;
       configStoreRequestSave();
     } else if (cursorPosition == 3) {
       currentScreen = SCREEN_SETTINGS;
     } else {
       selectedOption = cursorPosition;
+      emptyTimeField = 0;
     }
     markScreenDirty();
     return true;
@@ -1186,7 +1267,7 @@ void resetTimeCalibrationState() {
   emptyCalibrationStartedAt = 0;
   fillCalibrationButtonActive = false;
   emptyCalibrationButtonActive = false;
-  displayedCalibrationTenths = UINT16_MAX;
+  displayedCalibrationValue = UINT16_MAX;
 }
 
 // Zaokrągla czas w ms do dziesiątych części sekundy i ogranicza go do 99,9 s.
@@ -1195,6 +1276,17 @@ uint16_t measuredTimeTenths(uint32_t milliseconds) {
   const uint32_t tenths = (milliseconds + 50) / 100;
   return static_cast<uint16_t>(tenths > 999 ? 999 : tenths);
 }
+
+// Zaokrągla czas w ms w górę do pełnych sekund i ogranicza go do 999 s.
+// Argumenty: zmierzony czas w ms. Zwraca: czas w sekundach.
+uint16_t measuredTimeSeconds(uint32_t milliseconds) {
+  const uint32_t seconds = (milliseconds + 999) / 1000;
+  return static_cast<uint16_t>(seconds > 999 ? 999 : seconds);
+}
+
+// Zwraca limit pojedynczego pomiaru w ms: 99,9 s dla napełniania, 999 s dla opróżniania.
+// Argumenty: wybór pomiaru napełniania. Zwraca: limit w ms.
+uint32_t calibrationMaxMs(bool filling) { return filling ? 99900UL : 999000UL; }
 
 // Dopisuje zakończone przytrzymanie przycisku do czasu kalibracji i wyłącza wyjścia.
 // Argumenty: bieżący czas w ms i wybór pomiaru napełniania/opróżniania.
@@ -1208,17 +1300,17 @@ void accumulateCalibrationHold(uint32_t now, bool filling) {
       filling ? fillCalibrationStartedAt : emptyCalibrationStartedAt;
   if (buttonActive) {
     const uint64_t total = static_cast<uint64_t>(elapsed) + (now - startedAt);
-    elapsed = total > 99900 ? 99900 : static_cast<uint32_t>(total);
+    const uint32_t maxMs = calibrationMaxMs(filling);
+    elapsed = total > maxMs ? maxMs : static_cast<uint32_t>(total);
     buttonActive = false;
   }
   procedureSetManualOutputs(false, false);
 }
 
-// Oblicza wyświetlaną wartość kalibracji, uwzględniając trwające przytrzymanie.
-// Argumenty: bieżący czas w ms. Zwraca: czas w dziesiątych sekundy; nie zapisuje
-// wyniku do konfiguracji.
-uint16_t currentCalibrationDisplayTenths(uint32_t now) {
-  const bool filling = timeCalibrationStep == 2;
+// Oblicza łączny czas wybranego pomiaru, uwzględniając trwające przytrzymanie.
+// Argumenty: bieżący czas w ms i wybór pomiaru napełniania. Zwraca: czas w ms
+// ograniczony do limitu; nie zapisuje wyniku do konfiguracji.
+uint32_t currentCalibrationElapsedMs(uint32_t now, bool filling) {
   const uint32_t elapsed =
       filling ? fillCalibrationElapsedMs : emptyCalibrationElapsedMs;
   const bool buttonActive =
@@ -1228,8 +1320,17 @@ uint16_t currentCalibrationDisplayTenths(uint32_t now) {
   const uint64_t total =
       static_cast<uint64_t>(elapsed) +
       (buttonActive ? static_cast<uint32_t>(now - startedAt) : 0);
-  const uint32_t boundedTotal = total > 99900 ? 99900 : total;
-  return measuredTimeTenths(boundedTotal);
+  const uint32_t maxMs = calibrationMaxMs(filling);
+  return total > maxMs ? maxMs : static_cast<uint32_t>(total);
+}
+
+// Oblicza wyświetlaną wartość kalibracji: dziesiąte sekundy dla napełniania, pełne
+// sekundy (w górę) dla opróżniania. Argumenty: bieżący czas w ms. Zwraca: wartość
+// wyświetlaną; nie zapisuje wyniku do konfiguracji.
+uint16_t currentCalibrationDisplayValue(uint32_t now) {
+  const bool filling = timeCalibrationStep == 2;
+  const uint32_t elapsed = currentCalibrationElapsedMs(now, filling);
+  return filling ? measuredTimeTenths(elapsed) : measuredTimeSeconds(elapsed);
 }
 
 // Sprawdza, czy ręczne przyciski Z1/Z2 mogą sterować wyjściami na bieżącym ekranie.
@@ -1485,16 +1586,14 @@ bool timeCalibrationNextStep() {
   if (timeCalibrationStep == 3) {
     accumulateCalibrationHold(now, false);
     const uint16_t measuredTime =
-        measuredTimeTenths(emptyCalibrationElapsedMs);
+        measuredTimeSeconds(emptyCalibrationElapsedMs);
     if (measuredTime == 0) {
       procedureEncoderErrorBeep();
       return false;
     }
     config.empty_time = measuredTime;
-    const uint16_t requiredMaximum =
-        static_cast<uint16_t>((measuredTime + 9) / 10);
-    if (config.max_empty_time < requiredMaximum) {
-      config.max_empty_time = requiredMaximum;
+    if (config.max_empty_time < measuredTime) {
+      config.max_empty_time = measuredTime;
     }
     configStoreRequestSave();
     timeCalibrationStop();
@@ -1529,9 +1628,9 @@ void timeCalibrationUpdate() {
   }
 
   if (timeCalibrationStep == 2 || timeCalibrationStep == 3) {
-    const uint16_t tenths = currentCalibrationDisplayTenths(now);
-    if (tenths != displayedCalibrationTenths) {
-      displayedCalibrationTenths = tenths;
+    const uint16_t value = currentCalibrationDisplayValue(now);
+    if (value != displayedCalibrationValue) {
+      displayedCalibrationValue = value;
       markScreenDirty();
     }
   }

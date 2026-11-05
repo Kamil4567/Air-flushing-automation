@@ -29,6 +29,7 @@
 #define PRESSURE_CUTOFF_MIN_HPA 260
 #define PRESSURE_CUTOFF_MAX_HPA 1260
 #define DEFAULT_PRESSURE_CUTOFF_HPA 850
+#define MAX_EMPTY_TIME_SECONDS 5999
 
 enum StatusPhase : uint8_t {
   STATUS_EMPTY,
@@ -37,9 +38,10 @@ enum StatusPhase : uint8_t {
 
 struct Config {
   uint8_t cycles;
-  // Fill/empty values are tenths of a second; their limits are seconds.
+  // fill_time is tenths of a second; max_fill_time is seconds.
   uint16_t fill_time;
   uint16_t max_fill_time;
+  // empty_time and max_empty_time are whole seconds (max 99m59s).
   uint16_t empty_time;
   uint16_t max_empty_time;
   uint32_t actuation_time;
